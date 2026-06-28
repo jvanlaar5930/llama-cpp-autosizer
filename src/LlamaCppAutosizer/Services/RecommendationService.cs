@@ -165,6 +165,9 @@ Respond with ONLY this JSON (no markdown, no explanation outside JSON):
         }
     }
 
+    // All LLM-suggested values pass through here before being applied.
+    // Clamps every parameter to a safe range so a hallucinated value can't
+    // request absurd VRAM, zero threads, or a negative context window.
     private static (object? oldVal, object? newVal) ApplyToSettings(
         LlamaSettings settings, string parameter, JsonElement value)
     {
@@ -173,32 +176,52 @@ Respond with ONLY this JSON (no markdown, no explanation outside JSON):
             switch (parameter)
             {
                 case "GpuLayers":
-                    int ngl = value.GetInt32();
+                    // -1 = offload all (valid); positive values capped at 200
+                    // (no known model has more layers than that)
+                    int ngl = Math.Clamp(value.GetInt32(), -1, 200);
                     return (settings.GpuLayers, ngl != settings.GpuLayers ? ngl : (object?)null);
+
                 case "ContextSize":
-                    int ctx = value.GetInt32();
+                    // 512 minimum (anything less is unusable), 262144 maximum (256k)
+                    int ctx = Math.Clamp(value.GetInt32(), 512, 262144);
                     return (settings.ContextSize, ctx != settings.ContextSize ? ctx : (object?)null);
+
                 case "BatchSize":
-                    int bs = value.GetInt32();
+                    // 1–4096; common values are powers of 2
+                    int bs = Math.Clamp(value.GetInt32(), 1, 4096);
                     return (settings.BatchSize, bs != settings.BatchSize ? bs : (object?)null);
+
                 case "UBatchSize":
-                    int ubs = value.GetInt32();
+                    int ubs = Math.Clamp(value.GetInt32(), 1, 4096);
                     return (settings.UBatchSize, ubs != settings.UBatchSize ? ubs : (object?)null);
+
                 case "FlashAttention":
                     bool fa = value.GetBoolean();
                     return (settings.FlashAttention, fa != settings.FlashAttention ? fa : (object?)null);
+
                 case "CacheTypeK":
                     string ktk = value.GetString() ?? "f16";
+                    // Only allow known-valid types; reject anything else silently
+                    if (!LlamaSettings.ValidCacheTypes.Concat(LlamaSettings.TurboQuantCacheTypes).Contains(ktk))
+                        return (null, null);
                     return (settings.CacheTypeK ?? "f16", ktk != (settings.CacheTypeK ?? "f16") ? ktk : (object?)null);
+
                 case "CacheTypeV":
                     string ktv = value.GetString() ?? "f16";
+                    if (!LlamaSettings.ValidCacheTypes.Concat(LlamaSettings.TurboQuantCacheTypes).Contains(ktv))
+                        return (null, null);
                     return (settings.CacheTypeV ?? "f16", ktv != (settings.CacheTypeV ?? "f16") ? ktv : (object?)null);
+
                 case "Threads":
-                    int t = value.GetInt32();
+                    // At least 1, at most the number of logical processors on the machine
+                    int maxThreads = Math.Max(1, Environment.ProcessorCount);
+                    int t = Math.Clamp(value.GetInt32(), 1, maxThreads);
                     return (settings.Threads, t != settings.Threads ? t : (object?)null);
+
                 case "Mlock":
                     bool ml = value.GetBoolean();
                     return (settings.Mlock, ml != settings.Mlock ? ml : (object?)null);
+
                 default:
                     return (null, null);
             }
