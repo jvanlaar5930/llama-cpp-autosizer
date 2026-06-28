@@ -3,9 +3,9 @@ using Spectre.Console;
 namespace LlamaCppAutosizer.UI;
 
 /// <summary>
-/// Lightweight arrow-key navigation menu that supports Escape to go back.
-/// Replaces Spectre's SelectionPrompt so Escape and Ctrl+C work everywhere
-/// without racing against Spectre's internal Console.ReadKey loop.
+/// Lightweight arrow-key navigation menu with Escape-to-back and Ctrl+C support.
+/// Uses relative ANSI cursor-up movement for re-renders so the menu stays in place
+/// even when the terminal scrolls — absolute row tracking breaks after a scroll.
 /// </summary>
 public static class MenuHelper
 {
@@ -21,33 +21,28 @@ public static class MenuHelper
 
         int selected = 0;
         int scrollOffset = 0;
-        int menuStartRow = 0;
-        int menuHeight = 0;
+        int lastMenuHeight = 0;
 
         Console.CursorVisible = false;
         try
         {
-            // ── Pre-scroll so the menu fits below the current cursor ────────────
-            // title + separator + items + scroll-info + footer = visible + 4 lines
+            // Pre-scroll: if there isn't enough room below the cursor for the menu,
+            // print blank lines to push the content down, then move the cursor back up.
             int visible = Math.Min(pageSize, items.Count);
-            int needed = visible + 4;
-
-            // WindowHeight can be 0 in non-interactive contexts; guard against it.
-            int windowH = Math.Max(1, Console.WindowHeight);
+            int needed = visible + 4; // title + separator + items + scroll-info + footer
+            int windowH = Math.Max(8, Console.WindowHeight);
             needed = Math.Min(needed, windowH - 1);
-
             int gap = windowH - Console.CursorTop;
             if (gap < needed)
             {
-                // Print blank lines to push the menu into view, then move back up.
                 int pushDown = needed - gap;
                 for (int i = 0; i < pushDown; i++) Console.WriteLine();
-                Console.SetCursorPosition(0, Math.Max(0, Console.CursorTop - pushDown));
+                // Move cursor back up using relative ANSI (not SetCursorPosition)
+                Console.Write($"\x1b[{pushDown}A\r");
             }
-            menuStartRow = Console.CursorTop;
 
-            // ── Render + input loop ─────────────────────────────────────────────
             bool firstRender = true;
+
             while (!ct.IsCancellationRequested)
             {
                 // Clamp scroll window
@@ -55,21 +50,19 @@ public static class MenuHelper
                 if (selected < scrollOffset) scrollOffset = selected;
                 if (selected >= scrollOffset + visible) scrollOffset = selected - visible + 1;
 
-                if (!firstRender)
-                    SafeSetCursor(0, menuStartRow);
+                // On re-renders, move cursor UP by the number of lines we wrote last time.
+                // This is relative and survives terminal scrolling unlike SetCursorPosition.
+                if (!firstRender && lastMenuHeight > 0)
+                    Console.Write($"\x1b[{lastMenuHeight}A\r");
                 firstRender = false;
 
-                RenderMenu(title, items, selected, scrollOffset, visible, out menuHeight);
+                RenderMenu(title, items, selected, scrollOffset, visible, out lastMenuHeight);
 
-                // Poll for key in short bursts so Ctrl+C can cancel us without
-                // being stuck behind a blocking Console.ReadKey call.
+                // Poll for a key in short intervals so Ctrl+C can cancel without blocking.
                 while (!Console.KeyAvailable)
                 {
                     if (ct.IsCancellationRequested)
-                    {
-                        SafeSetCursor(0, menuStartRow + menuHeight);
                         return null;
-                    }
                     Thread.Sleep(20);
                 }
 
@@ -79,41 +72,30 @@ public static class MenuHelper
                     case ConsoleKey.UpArrow:
                         selected = selected > 0 ? selected - 1 : items.Count - 1;
                         break;
-
                     case ConsoleKey.DownArrow:
                         selected = selected < items.Count - 1 ? selected + 1 : 0;
                         break;
-
                     case ConsoleKey.Home:
                         selected = 0;
                         break;
-
                     case ConsoleKey.End:
                         selected = items.Count - 1;
                         break;
-
                     case ConsoleKey.PageUp:
                         selected = Math.Max(0, selected - pageSize);
                         break;
-
                     case ConsoleKey.PageDown:
                         selected = Math.Min(items.Count - 1, selected + pageSize);
                         break;
-
                     case ConsoleKey.Enter:
-                        SafeSetCursor(0, menuStartRow + menuHeight);
                         Console.WriteLine();
                         return items[selected];
-
                     case ConsoleKey.Escape:
-                        SafeSetCursor(0, menuStartRow + menuHeight);
                         Console.WriteLine();
                         return null;
                 }
             }
 
-            // Loop exited because ct was cancelled
-            SafeSetCursor(0, menuStartRow + menuHeight);
             return null;
         }
         finally
@@ -158,15 +140,14 @@ public static class MenuHelper
 
         for (int i = scrollOffset; i < scrollOffset + visible; i++)
         {
-            bool isSelected = i == selected;
             string raw = items[i];
-            string content = isSelected
+            string content = i == selected
                 ? $"[bold cyan] > {raw}[/]"
                 : $"   {raw}";
             WriteLine(ClearToEol(content, w));
         }
 
-        // Scroll info or blank spacer — keeps the footer row stable
+        // Scroll indicator or blank spacer — keeps footer on a stable row
         if (items.Count > visible)
             WriteLine($"[grey] ({scrollOffset + 1}–{scrollOffset + visible} of {items.Count})[/]");
         else
@@ -177,22 +158,11 @@ public static class MenuHelper
         linesWritten = lines;
     }
 
-    // Pads to terminal width so re-renders don't leave ghost characters from longer previous lines.
+    // Pads to terminal width so re-renders erase any leftover characters from longer lines.
     private static string ClearToEol(string markup, int width)
     {
         string plain = System.Text.RegularExpressions.Regex.Replace(markup, @"\[.*?\]", "");
         int pad = Math.Max(0, width - plain.Length - 1);
         return markup + new string(' ', pad);
-    }
-
-    // SetCursorPosition throws if the row is >= BufferHeight; clamp defensively.
-    private static void SafeSetCursor(int left, int top)
-    {
-        try
-        {
-            int maxRow = Math.Max(0, Console.BufferHeight - 1);
-            Console.SetCursorPosition(left, Math.Min(top, maxRow));
-        }
-        catch (ArgumentOutOfRangeException) { /* ignore in edge cases */ }
     }
 }
