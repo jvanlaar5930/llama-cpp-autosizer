@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Net.Http.Json;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -130,10 +131,11 @@ public class LlamaServerService(
         if (IsRunning) await StopAsync();
 
         _port = port;
+        var resolvedExe = ResolveExecutable(serverExecutable);
         var args = settings.ToServerArgs(modelPath, port);
-        logger.LogInformation("Starting: {Exe} {Args}", serverExecutable, string.Join(" ", args));
+        logger.LogInformation("Starting: {Exe} {Args}", resolvedExe, string.Join(" ", args));
 
-        var psi = new ProcessStartInfo(serverExecutable, args)
+        var psi = new ProcessStartInfo(resolvedExe, args)
         {
             UseShellExecute = false,
             RedirectStandardOutput = true,
@@ -149,6 +151,44 @@ public class LlamaServerService(
         _serverProcess.BeginErrorReadLine();
 
         await WaitForHealthAsync(ct);
+    }
+
+    // Resolve a user-supplied path that may be a directory or lack an extension.
+    // Mirrors TurboQuantService.ResolveWindowsExecutable — kept local to avoid coupling.
+    private static string ResolveExecutable(string path)
+    {
+        path = Environment.ExpandEnvironmentVariables(path.Trim());
+
+        // Directory — scan for llama-server inside it
+        if (Directory.Exists(path))
+        {
+            string[] names = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                ? ["llama-server.exe", "llama-server"]
+                : ["llama-server", "llama-server.exe"];
+
+            foreach (var name in names)
+            {
+                string candidate = Path.Combine(path, name);
+                if (File.Exists(candidate)) return candidate;
+            }
+
+            throw new FileNotFoundException(
+                $"llama-server executable not found in folder: {path}\n" +
+                $"Expected llama-server.exe or llama-server inside that directory.");
+        }
+
+        // File exists as-is
+        if (File.Exists(path)) return path;
+
+        // No extension on Windows — try .exe
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) &&
+            string.IsNullOrEmpty(Path.GetExtension(path)))
+        {
+            if (File.Exists(path + ".exe")) return path + ".exe";
+        }
+
+        // Assume it's a PATH command and let the OS resolve it
+        return path;
     }
 
     private async Task WaitForHealthAsync(CancellationToken ct)
