@@ -17,13 +17,21 @@ public class TurboQuantService(ILogger<TurboQuantService> logger)
         if (_cachedExecutable is not null) return _cachedExecutable;
 
         var candidates = new List<string>();
-        if (hint is not null) candidates.Add(hint);
+
+        // If the user provided a path, resolve it to something Windows can actually start.
+        // Without an extension Process.Start throws "Access is denied" on Windows.
+        if (hint is not null)
+        {
+            var resolved = ResolveWindowsExecutable(hint);
+            candidates.Add(resolved ?? hint);
+        }
+
+        // No dedicated turboquant binary — it ships as a custom llama-server build.
+        // If a hint was given and resolved above, nothing else to try here.
+        // We still check if the user has a turboquant-branded llama-server on PATH.
         candidates.AddRange([
-            "turboquant",
-            "turboquant.exe",
-            "llama-turboquant",
-            "llama-turboquant.exe",
-            "python -m turboquant",   // pip-installed
+            "llama-server",
+            "llama-server.exe",
         ]);
 
         foreach (var candidate in candidates)
@@ -39,6 +47,94 @@ public class TurboQuantService(ILogger<TurboQuantService> logger)
 
     public bool IsAvailable(string? executableHint = null)
         => FindExecutable(executableHint) is not null;
+
+    // -------------------------------------------------------------------------
+    // Resolve a user-provided string that may be a folder OR a direct exe path
+    // -------------------------------------------------------------------------
+
+    // llama-cpp-turboquant ships a custom llama-server build, not a separate binary.
+    // When the user points to a folder, we look for that server executable inside it.
+    private static readonly string[] KnownExeNames =
+    [
+        "llama-server.exe",
+        "llama-server",
+    ];
+
+    /// <summary>
+    /// Accepts either:
+    ///   • A direct path to the executable (or a path with no extension on Windows)
+    ///   • A folder — scans for any known turboquant executable names inside it
+    /// Returns the resolved executable string, or null if nothing usable was found.
+    /// </summary>
+    public string? ResolveFromUserInput(string input)
+    {
+        input = Environment.ExpandEnvironmentVariables(input.Trim());
+
+        // Direct file path — hand off to the normal resolver
+        if (File.Exists(input) || HasExecutableExtension(input))
+            return ResolveWindowsExecutable(input);
+
+        // User gave a folder — scan for known executable names
+        if (Directory.Exists(input))
+        {
+            foreach (var name in KnownExeNames)
+            {
+                var candidate = Path.Combine(input, name);
+                if (File.Exists(candidate))
+                    return candidate;
+            }
+            // Nothing found inside the folder
+            return null;
+        }
+
+        // Neither file nor folder — maybe a PATH command, try resolving extensions
+        return ResolveWindowsExecutable(input);
+    }
+
+    // -------------------------------------------------------------------------
+    // Resolve a user-supplied path to a runnable form on Windows
+    // -------------------------------------------------------------------------
+
+    // Windows won't execute files with no extension (throws "Access is denied").
+    // Try appending .exe / .bat / .cmd, detect .py files, and fall back to cmd /c.
+    private static string? ResolveWindowsExecutable(string path)
+    {
+        path = Environment.ExpandEnvironmentVariables(path.Trim());
+
+        // Python script — delegate to interpreter
+        if (path.EndsWith(".py", StringComparison.OrdinalIgnoreCase) && File.Exists(path))
+            return $"python \"{path}\"";
+
+        // File exists with a known executable extension — use as-is
+        if (File.Exists(path) && HasExecutableExtension(path))
+            return path;
+
+        // No recognised extension — try appending Windows executable extensions
+        if (!HasExecutableExtension(path))
+        {
+            foreach (var ext in new[] { ".exe", ".bat", ".cmd" })
+            {
+                if (File.Exists(path + ext))
+                    return path + ext;
+            }
+        }
+
+        // File exists but has an unrecognised extension — let cmd.exe try to run it
+        if (File.Exists(path))
+            return $"cmd /c \"{path}\"";
+
+        // Not a local file path — treat as a PATH command name (e.g. "turboquant")
+        return path;
+    }
+
+    private static bool HasExecutableExtension(string path)
+    {
+        var ext = Path.GetExtension(path);
+        return ext.Equals(".exe", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".bat", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".cmd", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".py",  StringComparison.OrdinalIgnoreCase);
+    }
 
     // -------------------------------------------------------------------------
     // Quantization
@@ -134,7 +230,10 @@ public class TurboQuantService(ILogger<TurboQuantService> logger)
     private static async Task<string> RunWithProgressAsync(
         string exe, string args, IProgress<string>? progress, CancellationToken ct)
     {
-        var psi = new ProcessStartInfo(exe, args)
+        // "cmd /c ..." and "python ..." style commands need the whole string parsed
+        var (fileName, arguments) = SplitCommand(exe, args);
+
+        var psi = new ProcessStartInfo(fileName, arguments)
         {
             UseShellExecute = false,
             RedirectStandardOutput = true,
@@ -166,15 +265,32 @@ public class TurboQuantService(ILogger<TurboQuantService> logger)
         return sb.ToString();
     }
 
+    // Split "cmd /c \"path\"" or "python \"path\"" into (fileName, rest + userArgs)
+    private static (string fileName, string arguments) SplitCommand(string exe, string args)
+    {
+        if (exe.StartsWith("cmd /c ", StringComparison.OrdinalIgnoreCase))
+            return ("cmd", $"/c {exe[7..]} {args}");
+
+        if (exe.StartsWith("python ", StringComparison.OrdinalIgnoreCase))
+            return ("python", $"{exe[7..]} {args}");
+
+        return (exe, args);
+    }
+
     private static bool IsExecutableAvailable(string exe)
     {
         try
         {
-            // Handle "python -m X" style
-            string actualExe = exe.StartsWith("python") ? "python" : exe;
-            string actualArgs = exe.StartsWith("python") ? $"-m {exe[(exe.IndexOf(' ') + 1)..]} --help" : "--help";
+            var (fileName, arguments) = SplitCommand(exe, "--help");
 
-            var psi = new ProcessStartInfo(actualExe, actualArgs)
+            // For "python -m X" style already encoded in exe
+            if (exe.StartsWith("python -m ", StringComparison.OrdinalIgnoreCase))
+            {
+                fileName = "python";
+                arguments = $"-m {exe[10..]} --help";
+            }
+
+            var psi = new ProcessStartInfo(fileName, arguments)
             {
                 UseShellExecute = false,
                 RedirectStandardOutput = true,

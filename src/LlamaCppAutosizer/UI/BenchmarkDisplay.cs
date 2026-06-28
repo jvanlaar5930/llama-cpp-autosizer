@@ -217,12 +217,12 @@ public static class BenchmarkDisplay
         {
             foreach (var gpu in hw.Gpus)
             {
-                table.AddRow($"GPU {gpu.Index}", $"[cyan]{gpu.Name}[/]");
+                table.AddRow($"GPU {gpu.Index}", $"[cyan]{Markup.Escape(gpu.Name)}[/]");
                 table.AddRow("  VRAM", $"[cyan]{gpu.VramTotalMb:N0} MB[/] ({gpu.VramFreeMb:N0} MB free)");
             }
         }
 
-        table.AddRow("CPU", $"[cyan]{hw.CpuName}[/]");
+        table.AddRow("CPU", $"[cyan]{Markup.Escape(hw.CpuName)}[/]");
         table.AddRow("Cores / Threads", $"[cyan]{hw.CpuCores} / {hw.CpuThreads}[/]");
         table.AddRow("RAM", $"[cyan]{hw.RamTotalMb:N0} MB[/] ({hw.RamFreeMb:N0} MB free)");
 

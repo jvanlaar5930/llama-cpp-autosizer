@@ -8,7 +8,9 @@ public class MainMenu(
     HardwareDetectionService hwService,
     OptimizerService optimizer,
     TurboQuantService turboQuant,
-    SessionPersistenceService persistence)
+    SessionPersistenceService persistence,
+    ProfileLibraryService profileLibrary,
+    ProfileMenu profileMenu)
 {
     // -------------------------------------------------------------------------
     // Configuration (loaded once, persisted to disk)
@@ -34,24 +36,28 @@ public class MainMenu(
 
         while (!ct.IsCancellationRequested)
         {
-            AnsiConsole.WriteLine();
-            var choice = AnsiConsole.Prompt(
-                new SelectionPrompt<string>()
-                    .Title("[bold yellow]llama.cpp Auto-Sizer[/] — Main Menu")
-                    .PageSize(15)
-                    .HighlightStyle(new Style(Color.Yellow))
-                    .AddChoices(
-                        "1. Select Model Folder  (auto-discover .gguf)",
-                        "2. Choose Profile  (Chat / Agentic)",
-                        "3. Set llama-server Path",
-                        "4. Detect Hardware",
-                        "5. Run Auto-Optimization",
-                        "6. Edit Settings Manually",
-                        "7. TurboQuant Options",
-                        "8. View / Load Sessions",
-                        "9. Historical Benchmark Comparison",
-                        "0. Exit"
-                    ));
+            AnsiConsole.Clear();
+            ShowBanner();
+
+            string? choice = MenuHelper.Select(
+                "[bold yellow]llama.cpp Auto-Sizer[/] — Main Menu",
+                [
+                    "1. Select Model Folder  (auto-discover .gguf)",
+                    "2. Choose Profile  (Chat / Agentic)",
+                    "3. Set llama-server Path",
+                    "4. Detect Hardware",
+                    "5. Run Auto-Optimization",
+                    "6. Edit Settings Manually",
+                    "7. Named Profiles  (run / manage)",
+                    "8. TurboQuant Options",
+                    "9. View / Load Sessions",
+                    "H. Historical Benchmark Comparison",
+                    "0. Exit",
+                ],
+                ct: ct);
+
+            // Escape on the main menu = exit
+            if (choice is null || choice[0] == '0') return;
 
             try
             {
@@ -63,10 +69,10 @@ public class MainMenu(
                     case '4': await DetectHardwareAsync(ct); break;
                     case '5': await RunOptimizationAsync(ct); break;
                     case '6': EditSettingsManually(); break;
-                    case '7': await TurboQuantMenuAsync(ct); break;
-                    case '8': await ViewSessionsAsync(ct); break;
-                    case '9': await HistoricalComparisonAsync(ct); break;
-                    case '0': return;
+                    case '7': await profileMenu.RunAsync(_serverExecutable, ct); break;
+                    case '8': await TurboQuantMenuAsync(ct); break;
+                    case '9': await ViewSessionsAsync(ct); break;
+                    case 'H': case 'h': await HistoricalComparisonAsync(ct); break;
                 }
                 SaveConfig();
             }
@@ -76,7 +82,7 @@ public class MainMenu(
             }
             catch (Exception ex)
             {
-                AnsiConsole.MarkupLine($"[red]Error:[/] {ex.Message}");
+                AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(ex.Message)}");
                 AnsiConsole.WriteLine("Press any key to continue...");
                 Console.ReadKey(intercept: true);
             }
@@ -142,10 +148,10 @@ public class MainMenu(
         BenchmarkDisplay.RenderModelList(models);
         AnsiConsole.WriteLine();
 
-        // Build choice list: file name + size as the label
+        // Build choice list — escape markup-special chars; use [[ ]] for literal brackets
         var choices = models
             .Select((m, i) =>
-                $"{i + 1,3}. {Path.GetFileName(m.Path)}  [{m.SizeMb:N0} MB]")
+                $"{i + 1,3}. {Markup.Escape(Path.GetFileName(m.Path))}  [[{m.SizeMb:N0} MB]]")
             .Append("── Enter path manually ──")
             .ToList();
 
@@ -184,7 +190,7 @@ public class MainMenu(
     {
         _modelPath = path;
         _manualSettings = new LlamaSettings();
-        AnsiConsole.MarkupLine($"[green]Model:[/] {Path.GetFileName(_modelPath)}  " +
+        AnsiConsole.MarkupLine($"[green]Model:[/] {Markup.Escape(Path.GetFileName(_modelPath))}  " +
             $"[grey]({new FileInfo(_modelPath).Length / (1024 * 1024):N0} MB)[/]");
     }
 
@@ -241,7 +247,7 @@ public class MainMenu(
         _serverExecutable = AnsiConsole.Prompt(
             new TextPrompt<string>("Path to [cyan]llama-server[/] executable:")
                 .DefaultValue(_serverExecutable));
-        AnsiConsole.MarkupLine($"[green]Server:[/] {_serverExecutable}");
+        AnsiConsole.MarkupLine($"[green]Server:[/] {Markup.Escape(_serverExecutable)}");
     }
 
     private async Task DetectHardwareAsync(CancellationToken ct)
@@ -295,7 +301,7 @@ public class MainMenu(
 
         AnsiConsole.Clear();
         AnsiConsole.Write(new Rule("[bold cyan]Running Optimization[/]").RuleStyle("cyan"));
-        AnsiConsole.MarkupLine($"[grey]Model: {session.ModelName}  Profile: {_profile.Name}  Max iterations: {maxIter}[/]");
+        AnsiConsole.MarkupLine($"[grey]Model: {Markup.Escape(session.ModelName)}  Profile: {Markup.Escape(_profile.Name)}  Max iterations: {maxIter}[/]");
         AnsiConsole.MarkupLine("[grey]Press Ctrl+C to stop early and keep the best result found so far.[/]");
         AnsiConsole.WriteLine();
 
@@ -338,16 +344,101 @@ public class MainMenu(
                 "Export path:",
                 $"results_{session.ModelName}_{session.Profile}.json");
             await persistence.ExportResultsAsync(session, path);
-            AnsiConsole.MarkupLine($"[green]Exported to {path}[/]");
+            AnsiConsole.MarkupLine($"[green]Exported to {Markup.Escape(path)}[/]");
         }
 
         _manualSettings = session.BestSettings ?? _manualSettings;
+
+        // Offer to save the best settings as a named profile for future use
+        if (session.BestSettings is not null &&
+            AnsiConsole.Confirm("\nSave best settings as a named profile?", true))
+        {
+            await SaveProfileFromSessionAsync(session);
+        }
     }
 
     private void EditSettingsManually()
     {
         _manualSettings = SettingsEditor.Edit(_manualSettings, "Manual Settings Editor");
         AnsiConsole.MarkupLine("[green]Settings updated.[/]");
+
+        if (string.IsNullOrEmpty(_modelPath) || !File.Exists(_modelPath))
+        {
+            AnsiConsole.MarkupLine("[grey](Select a model first to save as a named profile.)[/]");
+            return;
+        }
+
+        if (AnsiConsole.Confirm("Save these settings as a named profile?", false))
+        {
+            string name = AnsiConsole.Prompt(
+                new TextPrompt<string>("Profile name:")
+                    .Validate(n => !string.IsNullOrWhiteSpace(n)
+                        ? ValidationResult.Success()
+                        : ValidationResult.Error("Name cannot be empty")));
+
+            var profile = SavedProfile.FromSettings(name.Trim(), _modelPath, _manualSettings);
+            profileLibrary.SaveAsync(profile).GetAwaiter().GetResult();
+            AnsiConsole.MarkupLine($"[green]Profile saved:[/] {Markup.Escape(profile.Name)}");
+        }
+    }
+
+    private async Task SaveProfileFromSessionAsync(OptimizationSession session)
+    {
+        string defaultName = $"{session.ModelName} — {session.Profile}";
+        string name = AnsiConsole.Prompt(
+            new TextPrompt<string>("Profile name:")
+                .DefaultValue(defaultName)
+                .Validate(n => !string.IsNullOrWhiteSpace(n)
+                    ? ValidationResult.Success()
+                    : ValidationResult.Error("Name cannot be empty")));
+
+        string? notes = AnsiConsole.Prompt(
+            new TextPrompt<string>("Optional notes (empty to skip):")
+                .AllowEmpty());
+
+        var profile = SavedProfile.FromSession(session, name.Trim());
+        if (!string.IsNullOrWhiteSpace(notes)) profile.Notes = notes;
+
+        await profileLibrary.SaveAsync(profile);
+        AnsiConsole.MarkupLine($"[green]Profile saved:[/] {Markup.Escape(profile.Name)}");
+        AnsiConsole.MarkupLine("[grey]Access it any time from menu option 7.[/]");
+    }
+
+    private void ConfigureTurboQuantCacheTypes()
+    {
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(new Rule("[bold magenta]TurboQuant KV Cache Types[/]").RuleStyle("magenta"));
+        AnsiConsole.MarkupLine("[grey]These types are only supported by the TurboQuant fork of llama-server.[/]");
+        AnsiConsole.MarkupLine("[grey]Typical recommendation: --cache-type-k turbo4 --cache-type-v turbo3[/]");
+        AnsiConsole.WriteLine();
+
+        var allK = LlamaSettings.ValidCacheTypes.Concat(LlamaSettings.TurboQuantCacheTypes).ToArray();
+        var allV = allK;
+
+        string currentK = _manualSettings.CacheTypeK ?? "f16";
+        string currentV = _manualSettings.CacheTypeV ?? "f16";
+
+        AnsiConsole.MarkupLine($"[grey]Current cache-type-k:[/] [cyan]{currentK}[/]");
+        string? newK = MenuHelper.Select(
+            "Select [bold]cache-type-k[/]  [dim](Esc = keep current)[/]",
+            allK);
+        if (newK is not null) _manualSettings.CacheTypeK = newK == "f16" ? null : newK;
+
+        AnsiConsole.MarkupLine($"[grey]Current cache-type-v:[/] [cyan]{currentV}[/]");
+        string? newV = MenuHelper.Select(
+            "Select [bold]cache-type-v[/]  [dim](Esc = keep current)[/]",
+            allV);
+        if (newV is not null) _manualSettings.CacheTypeV = newV == "f16" ? null : newV;
+
+        string finalK = _manualSettings.CacheTypeK ?? "f16";
+        string finalV = _manualSettings.CacheTypeV ?? "f16";
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine($"[green]Set:[/] --cache-type-k [cyan]{finalK}[/]  --cache-type-v [cyan]{finalV}[/]");
+        AnsiConsole.MarkupLine("[grey]These settings are now active in manual settings and will be used on next run.[/]");
+        AnsiConsole.WriteLine();
+        AnsiConsole.WriteLine("Press any key...");
+        Console.ReadKey(intercept: true);
     }
 
     private async Task TurboQuantMenuAsync(CancellationToken ct)
@@ -361,27 +452,49 @@ public class MainMenu(
         if (!available)
         {
             AnsiConsole.MarkupLine("[yellow]turboquant not found in PATH.[/]");
-            string? customPath = AnsiConsole.Prompt(
-                new TextPrompt<string>("Path to turboquant executable (empty to skip):")
+            AnsiConsole.MarkupLine("[grey]You can provide a folder (will scan for the executable) or a direct path to the .exe.[/]");
+            AnsiConsole.WriteLine();
+
+            string? userInput = AnsiConsole.Prompt(
+                new TextPrompt<string>("Folder or path to turboquant (empty to skip):")
                     .AllowEmpty());
-            if (string.IsNullOrEmpty(customPath) || !turboQuant.IsAvailable(customPath))
+
+            if (string.IsNullOrWhiteSpace(userInput))
             {
-                AnsiConsole.MarkupLine("[red]turboquant not available. Install from the GitHub repo.[/]");
+                AnsiConsole.MarkupLine("[grey]Skipped.[/]");
+                AnsiConsole.WriteLine("Press any key...");
+                Console.ReadKey(intercept: true);
+                return;
+            }
+
+            // Resolve folder → executable
+            string? resolved = turboQuant.ResolveFromUserInput(userInput);
+            if (resolved is null || !turboQuant.IsAvailable(resolved))
+            {
+                AnsiConsole.MarkupLine($"[red]llama-server not found in:[/] {Markup.Escape(userInput)}");
+                AnsiConsole.MarkupLine("[grey]TurboQuant ships its own llama-server.exe. Point to the folder that contains it.[/]");
+                AnsiConsole.MarkupLine("[grey]Repo: https://github.com/TheTom/llama-cpp-turboquant[/]");
                 AnsiConsole.WriteLine("Press any key...");
                 Console.ReadKey(intercept: true);
                 return;
             }
         }
 
-        var choice = AnsiConsole.Prompt(
-            new SelectionPrompt<string>()
-                .Title("TurboQuant Options:")
-                .AddChoices(
-                    "Quantize a model",
-                    "Quantize current model and compare",
-                    "Back"));
+        string? choice = MenuHelper.Select(
+            "[bold magenta]TurboQuant Options[/]  [dim](Esc = back)[/]",
+            [
+                "Configure TurboQuant cache types  (turbo4 / turbo3 / …)",
+                "Quantize a model",
+                "Quantize current model and compare",
+            ]);
 
-        if (choice == "Back") return;
+        if (choice is null) return; // Escape
+
+        if (choice.StartsWith("Configure"))
+        {
+            ConfigureTurboQuantCacheTypes();
+            return;
+        }
 
         string inputModel = choice.Contains("current") && !string.IsNullOrEmpty(_modelPath)
             ? _modelPath
@@ -426,7 +539,7 @@ public class MainMenu(
         if (result.Success)
         {
             AnsiConsole.MarkupLine($"[green]Quantization complete![/]");
-            AnsiConsole.MarkupLine($"Output: [cyan]{result.OutputPath}[/]");
+            AnsiConsole.MarkupLine($"Output: [cyan]{Markup.Escape(result.OutputPath)}[/]");
             AnsiConsole.MarkupLine($"Size: [cyan]{result.OriginalSizeMb:N0} MB → {result.QuantizedSizeMb:N0} MB[/] " +
                 $"([green]{(1 - result.CompressionRatio) * 100:F1}% smaller[/])");
             AnsiConsole.MarkupLine($"Duration: [grey]{result.Duration:mm\\:ss}[/]");
@@ -439,7 +552,7 @@ public class MainMenu(
         }
         else
         {
-            AnsiConsole.MarkupLine($"[red]Quantization failed:[/] {result.ErrorMessage}");
+            AnsiConsole.MarkupLine($"[red]Quantization failed:[/] {Markup.Escape(result.ErrorMessage ?? "unknown error")}");
         }
 
         AnsiConsole.WriteLine("Press any key...");
@@ -514,7 +627,7 @@ public class MainMenu(
             string choice = AnsiConsole.Prompt(
                 new SelectionPrompt<string>()
                     .Title("Filter by model? (or show all):")
-                    .AddChoices(["Show all models", .. modelNames]));
+                    .AddChoices(["Show all models", .. modelNames.Select(Markup.Escape)]));
 
             if (choice != "Show all models")
                 filterModel = choice;
@@ -541,11 +654,10 @@ public class MainMenu(
             string path = AnsiConsole.Ask<string>(
                 "CSV output path:", "benchmark-comparison.csv");
             await persistence.ExportComparisonCsvAsync(displayed, path);
-            AnsiConsole.MarkupLine($"[green]Exported to {path}[/]");
+            AnsiConsole.MarkupLine($"[green]Exported to {Markup.Escape(path)}[/]");
         }
         else if (exportChoice.Contains("JSON"))
         {
-            // Re-use the existing per-session export in a loop
             string dir = AnsiConsole.Ask<string>(
                 "Output directory:", "results");
             Directory.CreateDirectory(dir);
@@ -554,7 +666,7 @@ public class MainMenu(
                 string outPath = Path.Combine(dir, $"{s.ModelName}_{s.Profile}_{s.StartedAt:yyyyMMdd_HHmm}.json");
                 await persistence.ExportResultsAsync(s, outPath);
             }
-            AnsiConsole.MarkupLine($"[green]Exported {displayed.Count} files to {dir}/[/]");
+            AnsiConsole.MarkupLine($"[green]Exported {displayed.Count} files to {Markup.Escape(dir)}/[/]");
         }
 
         AnsiConsole.WriteLine("Press any key...");

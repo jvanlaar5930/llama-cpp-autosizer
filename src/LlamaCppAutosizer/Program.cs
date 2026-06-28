@@ -22,8 +22,10 @@ services.AddSingleton<RecommendationService>();
 services.AddSingleton<OptimizerService>();
 services.AddSingleton<TurboQuantService>();
 services.AddSingleton<SessionPersistenceService>();
+services.AddSingleton<ProfileLibraryService>();
 
 // UI
+services.AddSingleton<ProfileMenu>();
 services.AddSingleton<MainMenu>();
 
 var provider = services.BuildServiceProvider();

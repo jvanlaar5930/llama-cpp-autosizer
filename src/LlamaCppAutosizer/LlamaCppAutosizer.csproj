@@ -9,8 +9,9 @@
     <RootNamespace>LlamaCppAutosizer</RootNamespace>
     <AssemblyName>llama-autosizer</AssemblyName>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <PublishSingleFile>true</PublishSingleFile>
-    <SelfContained>true</SelfContained>
+    <!-- Pass -r <RID> at publish time; e.g. win-x64, linux-x64, linux-arm64 -->
+    <PublishSingleFile Condition="'$(RuntimeIdentifier)' != ''">true</PublishSingleFile>
+    <SelfContained Condition="'$(RuntimeIdentifier)' != ''">true</SelfContained>
   </PropertyGroup>
 
   <ItemGroup>

@@ -87,6 +87,11 @@ public class LlamaSettings
            $"fa={FlashAttention} kv={CacheTypeK ?? "f16"}/{CacheTypeV ?? "f16"} " +
            $"threads={Threads}/{ThreadsBatch}";
 
+    // Standard llama.cpp types + turbo* types from the TurboQuant fork
     public static readonly string[] ValidCacheTypes =
-        ["f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl", "bf16"];
+        ["f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl"];
+
+    // Cache types only available in the llama-cpp-turboquant fork's llama-server
+    public static readonly string[] TurboQuantCacheTypes =
+        ["turbo4", "turbo3", "turbo2", "turbo1", "turbo8"];
 }
