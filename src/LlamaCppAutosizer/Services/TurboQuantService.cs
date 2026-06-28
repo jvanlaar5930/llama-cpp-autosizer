@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using LlamaCppAutosizer.Models;
 using Microsoft.Extensions.Logging;
 
@@ -277,33 +278,42 @@ public class TurboQuantService(ILogger<TurboQuantService> logger)
         return (exe, args);
     }
 
+    // Check whether an executable is accessible without spawning a process.
+    // Spawning to probe availability triggers Windows Defender heuristics.
     private static bool IsExecutableAvailable(string exe)
     {
-        try
-        {
-            var (fileName, arguments) = SplitCommand(exe, "--help");
+        // Compound forms like "cmd /c ..." or "python ..." — check the leading command only
+        var (fileName, _) = SplitCommand(exe, "");
+        fileName = fileName.Trim();
 
-            // For "python -m X" style already encoded in exe
-            if (exe.StartsWith("python -m ", StringComparison.OrdinalIgnoreCase))
+        // Absolute or relative path — just check the file
+        if (fileName.Contains(Path.DirectorySeparatorChar) ||
+            fileName.Contains(Path.AltDirectorySeparatorChar) ||
+            (fileName.Length >= 3 && fileName[1] == ':'))
+        {
+            return File.Exists(fileName);
+        }
+
+        // Short command name (e.g. "llama-server", "python") — search PATH
+        string pathEnv = Environment.GetEnvironmentVariable("PATH") ?? "";
+        string[] pathDirs = pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries);
+
+        // On Windows also try with .exe if no extension given
+        var namesToTry = new List<string> { fileName };
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) &&
+            !HasExecutableExtension(fileName))
+        {
+            namesToTry.Add(fileName + ".exe");
+        }
+
+        foreach (var dir in pathDirs)
+        {
+            foreach (var name in namesToTry)
             {
-                fileName = "python";
-                arguments = $"-m {exe[10..]} --help";
+                if (File.Exists(Path.Combine(dir, name)))
+                    return true;
             }
-
-            var psi = new ProcessStartInfo(fileName, arguments)
-            {
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-            };
-            using var proc = Process.Start(psi);
-            proc?.Kill();
-            return true;
         }
-        catch
-        {
-            return false;
-        }
+        return false;
     }
 }

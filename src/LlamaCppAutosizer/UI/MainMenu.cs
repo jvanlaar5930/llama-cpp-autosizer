@@ -36,7 +36,6 @@ public class MainMenu(
 
         while (!ct.IsCancellationRequested)
         {
-            AnsiConsole.Clear();
             ShowBanner();
 
             string? choice = MenuHelper.Select(
@@ -192,6 +191,9 @@ public class MainMenu(
         _manualSettings = new LlamaSettings();
         AnsiConsole.MarkupLine($"[green]Model:[/] {Markup.Escape(Path.GetFileName(_modelPath))}  " +
             $"[grey]({new FileInfo(_modelPath).Length / (1024 * 1024):N0} MB)[/]");
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[grey]Press any key to return to menu...[/]");
+        Console.ReadKey(intercept: true);
     }
 
     private void ChooseProfile()
@@ -212,6 +214,10 @@ public class MainMenu(
         // Let the user adjust scoring weights if desired
         if (AnsiConsole.Confirm("Customize scoring weights?", false))
             CustomizeWeights();
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[grey]Press any key to return to menu...[/]");
+        Console.ReadKey(intercept: true);
     }
 
     private void CustomizeWeights()
@@ -248,6 +254,9 @@ public class MainMenu(
             new TextPrompt<string>("Path to [cyan]llama-server[/] executable:")
                 .DefaultValue(_serverExecutable));
         AnsiConsole.MarkupLine($"[green]Server:[/] {Markup.Escape(_serverExecutable)}");
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[grey]Press any key to return to menu...[/]");
+        Console.ReadKey(intercept: true);
     }
 
     private async Task DetectHardwareAsync(CancellationToken ct)
@@ -260,6 +269,9 @@ public class MainMenu(
             });
 
         BenchmarkDisplay.RenderHardwareInfo(_hardware);
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[grey]Press any key to return to menu...[/]");
+        Console.ReadKey(intercept: true);
     }
 
     private async Task RunOptimizationAsync(CancellationToken ct)
@@ -365,10 +377,8 @@ public class MainMenu(
         if (string.IsNullOrEmpty(_modelPath) || !File.Exists(_modelPath))
         {
             AnsiConsole.MarkupLine("[grey](Select a model first to save as a named profile.)[/]");
-            return;
         }
-
-        if (AnsiConsole.Confirm("Save these settings as a named profile?", false))
+        else if (AnsiConsole.Confirm("Save these settings as a named profile?", false))
         {
             string name = AnsiConsole.Prompt(
                 new TextPrompt<string>("Profile name:")
@@ -380,6 +390,10 @@ public class MainMenu(
             profileLibrary.SaveAsync(profile).GetAwaiter().GetResult();
             AnsiConsole.MarkupLine($"[green]Profile saved:[/] {Markup.Escape(profile.Name)}");
         }
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[grey]Press any key to return to menu...[/]");
+        Console.ReadKey(intercept: true);
     }
 
     private async Task SaveProfileFromSessionAsync(OptimizationSession session)
@@ -695,7 +709,7 @@ public class MainMenu(
         return false;
     }
 
-    private static void ShowBanner()
+    private void ShowBanner()
     {
         AnsiConsole.Clear();
         AnsiConsole.Write(
@@ -704,7 +718,66 @@ public class MainMenu(
                 .Color(Color.Cyan1));
         AnsiConsole.MarkupLine("[grey]Auto-tune llama.cpp settings for optimal local LLM performance[/]");
         AnsiConsole.MarkupLine("[grey]TurboQuant: https://github.com/TheTom/llama-cpp-turboquant[/]");
+
+        // Show current session state if anything is configured
+        bool hasModel = !string.IsNullOrEmpty(_modelPath) && File.Exists(_modelPath);
+        bool hasServer = !string.IsNullOrEmpty(_serverExecutable);
+
+        if (hasModel || hasServer || _manualSettings.GpuLayers != new LlamaSettings().GpuLayers)
+        {
+            AnsiConsole.WriteLine();
+            RenderStatusPanel(hasModel, hasServer);
+        }
+
         AnsiConsole.WriteLine();
+    }
+
+    private void RenderStatusPanel(bool hasModel, bool hasServer)
+    {
+        var grid = new Grid().AddColumn().AddColumn();
+
+        // ── Model / server row ────────────────────────────────────────────────
+        string modelCell = hasModel
+            ? $"[bold deepskyblue1]{Markup.Escape(Path.GetFileNameWithoutExtension(_modelPath))}[/]"
+            : "[grey]no model selected[/]";
+
+        string serverCell = hasServer
+            ? $"[deepskyblue1]{Markup.Escape(Path.GetFileName(_serverExecutable))}[/]"
+            : "[grey]not set[/]";
+
+        // ── Settings summary row ──────────────────────────────────────────────
+        var s = _manualSettings;
+        string ngl    = s.GpuLayers == -1 ? "[magenta1]all[/]" : $"[magenta1]{s.GpuLayers}[/]";
+        string ctx    = $"[deepskyblue1]{s.ContextSize:N0}[/]";
+        string fa     = s.FlashAttention ? "[chartreuse1]on[/]"  : "[grey]off[/]";
+        string cacheK = s.CacheTypeK is null ? "[grey]f16[/]" : $"[magenta1]{s.CacheTypeK}[/]";
+        string cacheV = s.CacheTypeV is null ? "[grey]f16[/]" : $"[magenta1]{s.CacheTypeV}[/]";
+        string prof   = $"[yellow]{_profile.Name}[/]";
+
+        var inner = new Table()
+            .Border(TableBorder.None)
+            .HideHeaders()
+            .AddColumn(new TableColumn("").Width(14))
+            .AddColumn("");
+
+        inner.AddRow("[grey]model[/]",    modelCell);
+        inner.AddRow("[grey]server[/]",   serverCell);
+        inner.AddRow("[grey]profile[/]",  prof);
+        inner.AddRow("[grey]ngl[/]",      ngl);
+        inner.AddRow("[grey]ctx[/]",      ctx);
+        inner.AddRow("[grey]flash-attn[/]", fa);
+        inner.AddRow("[grey]kv-k / kv-v[/]", $"{cacheK} [grey]/[/] {cacheV}");
+
+        if (!string.IsNullOrWhiteSpace(s.ExtraArgs))
+            inner.AddRow("[grey]extra args[/]", $"[dim]{Markup.Escape(s.ExtraArgs)}[/]");
+
+        AnsiConsole.Write(new Panel(inner)
+        {
+            Header = new PanelHeader("[bold magenta1] ▸ current config [/]"),
+            Border = BoxBorder.Heavy,
+            BorderStyle = new Style(Color.DeepSkyBlue1),
+            Padding = new Padding(1, 0),
+        });
     }
 
     // -------------------------------------------------------------------------
