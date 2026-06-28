@@ -1,0 +1,22 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.DotSettings.user
+
+## NuGet
+*.nupkg
+packages/
+.nuget/
+
+## Sessions and output
+sessions/
+*.session.json
+results/
+
+## OS
+.DS_Store
+Thumbs.db
+desktop.ini
