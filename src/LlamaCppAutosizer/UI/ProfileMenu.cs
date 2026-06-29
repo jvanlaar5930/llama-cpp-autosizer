@@ -2,6 +2,7 @@ using LlamaCppAutosizer.Models;
 using LlamaCppAutosizer.Services;
 using LlamaCppAutosizer.UI;
 using Spectre.Console;
+using Spectre.Console.Rendering;
 
 namespace LlamaCppAutosizer.UI;
 
@@ -94,8 +95,13 @@ public class ProfileMenu(
         AnsiConsole.Write(new Rule($"[bold green]Running:[/] [cyan]{Markup.Escape(profile.Name)}[/]").RuleStyle("green"));
         AnsiConsole.WriteLine();
 
-        // Start server
+        // Buffer logs during the startup spinner so they don't corrupt ANSI rendering.
+        // On failure: flush to console. On success: move to the live display queue.
+        var startupLogs = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        server.SetLogHandler(startupLogs.Enqueue);
+
         bool started = false;
+        string? startError = null;
         await AnsiConsole.Status()
             .Spinner(Spinner.Known.Dots)
             .StartAsync($"Starting llama-server for [cyan]{Markup.Escape(profile.Name)}[/]...", async ctx =>
@@ -107,12 +113,21 @@ public class ProfileMenu(
                 }
                 catch (Exception ex)
                 {
-                    AnsiConsole.MarkupLine($"[red]Failed to start server:[/] {Markup.Escape(ex.Message)}");
+                    startError = ex.Message;
                 }
             });
 
         if (!started)
         {
+            AnsiConsole.MarkupLine($"[red]Failed to start server:[/] {Markup.Escape(startError ?? "unknown error")}");
+            AnsiConsole.WriteLine();
+            if (!startupLogs.IsEmpty)
+            {
+                AnsiConsole.MarkupLine("[grey]llama-server output:[/]");
+                while (startupLogs.TryDequeue(out var line))
+                    Console.WriteLine(line);
+                AnsiConsole.WriteLine();
+            }
             AnsiConsole.WriteLine("Press any key...");
             Console.ReadKey(intercept: true);
             return;
@@ -120,13 +135,73 @@ public class ProfileMenu(
 
         await library.RecordRunAsync(profile);
 
-        // Show the running panel
-        RenderRunningPanel(profile);
+        // --- Live display: settings + real-time stats + rolling log ---
 
-        AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[grey]Press any key to stop the server.[/]");
-        Console.ReadKey(intercept: true);
+        var logQueue = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        // Move any buffered startup logs into the display queue
+        while (startupLogs.TryDequeue(out var l)) logQueue.Enqueue(l);
+        server.SetLogHandler(logQueue.Enqueue);
 
+        var stopCts = new CancellationTokenSource();
+        _ = Task.Run(() => { Console.ReadKey(true); stopCts.Cancel(); });
+
+        int? pid = server.ServerProcessId;
+        var prevCpuTime = TimeSpan.Zero;
+        var prevCpuSample = DateTime.UtcNow;
+        (int GpuPct, long UsedMb, long TotalMb)? gpuStats = null;
+        int gpuPollTick = 0;
+        var logLines = new Queue<string>();
+        const int MaxLogLines = 20;
+
+        await AnsiConsole.Live(BuildRunningPanel(profile, null, null, []))
+            .AutoClear(false)
+            .StartAsync(async ctx =>
+            {
+                while (!stopCts.IsCancellationRequested)
+                {
+                    // Drain new log lines into rolling buffer
+                    while (logQueue.TryDequeue(out var line))
+                    {
+                        logLines.Enqueue(line);
+                        while (logLines.Count > MaxLogLines) logLines.Dequeue();
+                    }
+
+                    // Sample llama-server process stats
+                    (double CpuPct, double RamGb)? procStats = null;
+                    if (pid.HasValue)
+                    {
+                        try
+                        {
+                            var proc = System.Diagnostics.Process.GetProcessById(pid.Value);
+                            var now = DateTime.UtcNow;
+                            var cpuTime = proc.TotalProcessorTime;
+                            if (prevCpuTime != TimeSpan.Zero)
+                            {
+                                var elapsedMs = (now - prevCpuSample).TotalMilliseconds;
+                                var cpuMs = (cpuTime - prevCpuTime).TotalMilliseconds;
+                                double cpuPct = elapsedMs > 0
+                                    ? Math.Min(100.0, cpuMs / (elapsedMs * Environment.ProcessorCount) * 100.0)
+                                    : 0;
+                                procStats = (cpuPct, proc.WorkingSet64 / (1024.0 * 1024 * 1024));
+                            }
+                            prevCpuTime = cpuTime;
+                            prevCpuSample = now;
+                        }
+                        catch { /* process exited */ }
+                    }
+
+                    // Poll GPU every 3 seconds
+                    if (gpuPollTick++ % 3 == 0)
+                        gpuStats = await GetGpuStatsAsync();
+
+                    ctx.UpdateTarget(BuildRunningPanel(profile, procStats, gpuStats, [.. logLines]));
+
+                    try { await Task.Delay(1000, stopCts.Token); }
+                    catch (TaskCanceledException) { break; }
+                }
+            });
+
+        server.SetLogHandler(null);
         await AnsiConsole.Status()
             .StartAsync("Stopping server...", async _ => await server.StopAsync());
 
@@ -134,39 +209,131 @@ public class ProfileMenu(
         await Task.Delay(600, CancellationToken.None);
     }
 
-    private static void RenderRunningPanel(SavedProfile profile)
+    private static IRenderable BuildRunningPanel(
+        SavedProfile profile,
+        (double CpuPct, double RamGb)? proc,
+        (int GpuPct, long UsedMb, long TotalMb)? gpu,
+        string[] logs)
     {
-        var inner = new Table().Border(TableBorder.None).HideHeaders()
-            .AddColumn("").AddColumn("");
+        var s = profile.Settings;
+        bool isMoe = s.MoeExpertUsed.HasValue;
+        bool isThinking = s.ThinkingEnabled.HasValue;
 
-        inner.AddRow("[grey]Model[/]",    $"[cyan]{Markup.Escape(profile.ModelName)}[/]");
-        inner.AddRow("[grey]Profile[/]",  $"[cyan]{Markup.Escape(profile.Name)}[/]");
-        inner.AddRow("[grey]Endpoint[/]", "[bold]http://127.0.0.1:8080/v1[/]");
-        inner.AddRow("[grey]Health[/]",   "[bold]http://127.0.0.1:8080/health[/]");
-        inner.AddRow("", "");
-        inner.AddRow("[grey]Context[/]",  $"[cyan]{profile.Settings.ContextSize:N0} tokens[/]");
-        inner.AddRow("[grey]GPU layers[/]", $"[cyan]{(profile.Settings.GpuLayers == -1 ? "all" : profile.Settings.GpuLayers)}[/]");
-        inner.AddRow("[grey]Flash attn[/]", profile.Settings.FlashAttention ? "[green]on[/]" : "[grey]off[/]");
-        inner.AddRow("[grey]KV cache K[/]", $"[cyan]{profile.Settings.CacheTypeK ?? "f16"}[/]");
-        inner.AddRow("[grey]KV cache V[/]", $"[cyan]{profile.Settings.CacheTypeV ?? "f16"}[/]");
+        var info = new Table().Border(TableBorder.None).HideHeaders()
+            .AddColumn(new TableColumn("").NoWrap())
+            .AddColumn("");
+
+        info.AddRow("[grey]Model[/]",    $"[cyan]{Markup.Escape(profile.ModelName)}[/]");
+        info.AddRow("[grey]Profile[/]",  $"[cyan]{Markup.Escape(profile.Name)}[/]");
+        info.AddRow("[grey]Endpoints[/]", "[bold]http://127.0.0.1:8080/v1[/]  [grey]/health  /metrics[/]");
+        info.AddRow("", "");
+
+        // All settings (mirrors llama-server command exactly)
+        info.AddRow("[grey]ctx-size[/]",      $"[cyan]{s.ContextSize:N0}[/] tokens");
+        info.AddRow("[grey]n-gpu-layers[/]",   $"[cyan]{(s.GpuLayers == -1 ? "all" : s.GpuLayers)}[/]");
+        info.AddRow("[grey]batch-size[/]",     $"[cyan]{s.BatchSize}[/]");
+        info.AddRow("[grey]ubatch-size[/]",    $"[cyan]{s.UBatchSize}[/]");
+        info.AddRow("[grey]parallel[/]",       $"[cyan]{s.ParallelSlots}[/]");
+        info.AddRow("[grey]threads[/]",        $"[cyan]{(s.Threads < 0 ? "auto" : s.Threads)}[/]");
+        info.AddRow("[grey]threads-batch[/]",  $"[cyan]{(s.ThreadsBatch < 0 ? "auto" : s.ThreadsBatch)}[/]");
+        info.AddRow("[grey]flash-attn[/]",     s.FlashAttention ? "[green]yes[/]" : "no");
+        info.AddRow("[grey]mmap[/]",           s.Mmap ? "yes" : "[yellow]no (--no-mmap)[/]");
+        info.AddRow("[grey]mlock[/]",          s.Mlock ? "[yellow]yes[/]" : "no");
+        info.AddRow("[grey]cache-type-k[/]",   $"[cyan]{s.CacheTypeK ?? "f16"}[/]");
+        info.AddRow("[grey]cache-type-v[/]",   $"[cyan]{s.CacheTypeV ?? "f16"}[/]");
+        if (isMoe)
+            info.AddRow("[grey]experts (MoE)[/]", $"[cyan]{s.MoeExpertUsed!.Value}[/]");
+        if (isThinking)
+        {
+            string tv = s.ThinkingEnabled switch { true => "[green]enabled[/]", false => "[grey]disabled[/]", _ => "model default" };
+            info.AddRow("[grey]thinking[/]", tv);
+        }
+        if (!string.IsNullOrWhiteSpace(s.ExtraArgs))
+            info.AddRow("[grey]extra-args[/]", $"[yellow]{Markup.Escape(s.ExtraArgs)}[/]");
 
         if (profile.BenchmarkTgRate.HasValue)
         {
-            inner.AddRow("", "");
-            inner.AddRow("[grey]Expected TG[/]", $"[green]~{profile.BenchmarkTgRate:F0} t/s[/]");
-            inner.AddRow("[grey]Expected PP[/]", $"[green]~{profile.BenchmarkPpRate:F0} t/s[/]");
-            inner.AddRow("[grey]Expected TTFT[/]", $"[green]~{profile.BenchmarkTtftMs:F0} ms[/]");
+            info.AddRow("", "");
+            info.AddRow("[grey]Benchmark TG[/]",   $"[green]~{profile.BenchmarkTgRate:F0} t/s[/]");
+            info.AddRow("[grey]Benchmark PP[/]",   $"[green]~{profile.BenchmarkPpRate:F0} t/s[/]");
+            info.AddRow("[grey]Benchmark TTFT[/]", $"[green]~{profile.BenchmarkTtftMs:F0} ms[/]");
+        }
+
+        // Real-time stats
+        info.AddRow("", "");
+        if (proc.HasValue)
+        {
+            info.AddRow("[grey]CPU  (server)[/]", FormatPct(proc.Value.CpuPct));
+            info.AddRow("[grey]RAM  (server)[/]", $"[cyan]{proc.Value.RamGb:F2} GB[/]");
+        }
+        else
+        {
+            info.AddRow("[grey]CPU  (server)[/]", "[dim]sampling...[/]");
+            info.AddRow("[grey]RAM  (server)[/]", "[dim]sampling...[/]");
+        }
+        if (gpu.HasValue)
+        {
+            info.AddRow("[grey]GPU[/]", FormatPct(gpu.Value.GpuPct));
+            info.AddRow("[grey]VRAM[/]", $"[cyan]{gpu.Value.UsedMb / 1024.0:F1} / {gpu.Value.TotalMb / 1024.0:F1} GB[/]");
         }
 
         if (!string.IsNullOrWhiteSpace(profile.Notes))
-            inner.AddRow("[grey]Notes[/]", $"[italic]{Markup.Escape(profile.Notes)}[/]");
-
-        AnsiConsole.Write(new Panel(inner)
         {
-            Header = new PanelHeader("[bold green] Server Running [/]"),
+            info.AddRow("", "");
+            info.AddRow("[grey]Notes[/]", $"[italic]{Markup.Escape(profile.Notes)}[/]");
+        }
+
+        List<IRenderable> parts = [new Padder(info, new Padding(1, 0))];
+
+        if (logs.Length > 0)
+        {
+            parts.Add(new Rule("[grey dim]logs[/]").RuleStyle("grey dim"));
+            foreach (var line in logs)
+                parts.Add(new Text(line));
+        }
+
+        var panel = new Panel(new Rows(parts))
+        {
+            Header = new PanelHeader("[bold green] Server Running [/]  [grey]press any key to stop[/]"),
             Border = BoxBorder.Double,
-            Padding = new Padding(1, 0),
-        });
+            Padding = new Padding(0, 0),
+        };
+
+        return panel;
+    }
+
+    private static string FormatPct(double pct)
+    {
+        var col = pct > 90 ? "red" : pct > 70 ? "yellow" : "green";
+        return $"[{col}]{pct:F1}%[/{col}]";
+    }
+
+    private static async Task<(int GpuPct, long UsedMb, long TotalMb)?> GetGpuStatsAsync()
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo(
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits")
+            {
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            using var p = System.Diagnostics.Process.Start(psi);
+            if (p is null) return null;
+            var line = await p.StandardOutput.ReadLineAsync();
+            await p.WaitForExitAsync();
+            if (line is null) return null;
+            var parts = line.Split(',');
+            if (parts.Length >= 3
+                && int.TryParse(parts[0].Trim(), out int gpuPct)
+                && long.TryParse(parts[1].Trim(), out long used)
+                && long.TryParse(parts[2].Trim(), out long total))
+                return (gpuPct, used, total);
+        }
+        catch { }
+        return null;
     }
 
     // -------------------------------------------------------------------------

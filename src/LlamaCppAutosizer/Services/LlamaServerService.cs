@@ -111,6 +111,11 @@ public class LlamaServerService(
 {
     private Process? _serverProcess;
     private int _port = 8080;
+    private Action<string>? _logHandler;
+    private readonly System.Collections.Concurrent.ConcurrentQueue<string> _logBuffer = new();
+    private const int LogBufferMax = 150;
+    // Sticky flag: once mmap fails on this machine/session, skip it on all future starts
+    private bool _mmapFailed;
     private readonly JsonSerializerOptions _jsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -119,8 +124,10 @@ public class LlamaServerService(
 
     public bool IsRunning => _serverProcess is { HasExited: false };
     public string BaseUrl => $"http://127.0.0.1:{_port}";
+    public int? ServerProcessId => _serverProcess is { HasExited: false } ? _serverProcess.Id : null;
 
-    /// <summary>Starts llama-server with the given settings. Waits until the health endpoint responds.</summary>
+    /// <summary>Starts llama-server with the given settings. Waits until the health endpoint responds.
+    /// Automatically retries with --no-mmap if a memory-mapping failure is detected.</summary>
     public async Task StartAsync(
         string serverExecutable,
         string modelPath,
@@ -131,11 +138,41 @@ public class LlamaServerService(
         if (IsRunning) await StopAsync();
 
         _port = port;
-        var resolvedExe = ResolveExecutable(serverExecutable);
-        var args = settings.ToServerArgs(modelPath, port);
-        logger.LogInformation("Starting: {Exe} {Args}", resolvedExe, string.Join(" ", args));
+        while (_logBuffer.TryDequeue(out string? _)) { }
 
-        var psi = new ProcessStartInfo(resolvedExe, args)
+        var resolvedExe = ResolveExecutable(serverExecutable);
+
+        // If mmap already failed this session, skip it rather than waste a retry cycle
+        var effectiveSettings = (_mmapFailed && settings.Mmap) ? WithNoMmap(settings) : settings;
+
+        LaunchProcess(resolvedExe, effectiveSettings, modelPath, port);
+
+        try
+        {
+            await WaitForHealthAsync(ct);
+        }
+        catch (InvalidOperationException ex) when (settings.Mmap && !_mmapFailed && IsMmapFailure(ex.Message))
+        {
+            // mmap failed — kill the crashed process, then retry without it
+            _mmapFailed = true;
+            _logHandler?.Invoke(
+                "[autosizer] Memory-mapping failed (GGML_ASSERT mmap) — retrying with --no-mmap");
+
+            await KillProcessAsync();
+            while (_logBuffer.TryDequeue(out string? _)) { }
+
+            LaunchProcess(resolvedExe, WithNoMmap(settings), modelPath, port);
+            await WaitForHealthAsync(ct);   // if this also fails, let it throw normally
+        }
+    }
+
+    // Spawns the process and wires up stderr capture. Does not wait for health.
+    private void LaunchProcess(string exe, LlamaSettings settings, string modelPath, int port)
+    {
+        var args = settings.ToServerArgs(modelPath, port);
+        logger.LogInformation("Starting: {Exe} {Args}", exe, string.Join(" ", args));
+
+        var psi = new ProcessStartInfo(exe, args)
         {
             UseShellExecute = false,
             RedirectStandardOutput = true,
@@ -146,11 +183,42 @@ public class LlamaServerService(
         _serverProcess = Process.Start(psi)
             ?? throw new InvalidOperationException("Failed to start llama-server process.");
 
-        // Suppress logs (they go to stderr)
-        _serverProcess.ErrorDataReceived += (_, _) => { };
+        _serverProcess.ErrorDataReceived += (_, e) =>
+        {
+            if (e.Data is null) return;
+            _logBuffer.Enqueue(e.Data);
+            while (_logBuffer.Count > LogBufferMax)
+                _logBuffer.TryDequeue(out string? _);
+            _logHandler?.Invoke(e.Data);
+        };
         _serverProcess.BeginErrorReadLine();
+    }
 
-        await WaitForHealthAsync(ct);
+    private async Task KillProcessAsync()
+    {
+        if (_serverProcess is null) return;
+        try
+        {
+            if (!_serverProcess.HasExited)
+            {
+                _serverProcess.Kill(entireProcessTree: true);
+                await _serverProcess.WaitForExitAsync();
+            }
+        }
+        catch { /* ignore */ }
+        _serverProcess.Dispose();
+        _serverProcess = null;
+    }
+
+    private static bool IsMmapFailure(string message) =>
+        message.Contains("llama-mmap", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("GGML_ASSERT(addr)", StringComparison.OrdinalIgnoreCase);
+
+    private static LlamaSettings WithNoMmap(LlamaSettings s)
+    {
+        var c = s.Clone();
+        c.Mmap = false;
+        return c;
     }
 
     // Resolve a user-supplied path that may be a directory or lack an extension.
@@ -200,7 +268,15 @@ public class LlamaServerService(
         while (DateTime.UtcNow < deadline && !ct.IsCancellationRequested)
         {
             if (_serverProcess?.HasExited == true)
-                throw new InvalidOperationException("llama-server exited unexpectedly during startup.");
+            {
+                // Brief pause so the async stderr reader can flush remaining lines
+                await Task.Delay(200, CancellationToken.None);
+                var lines = _logBuffer.ToArray();
+                string output = lines.Length > 0
+                    ? "\n\nllama-server output:\n" + string.Join("\n", lines)
+                    : "\n\n(no output captured — check that the executable path is correct)";
+                throw new InvalidOperationException($"llama-server exited unexpectedly during startup.{output}");
+            }
 
             try
             {
@@ -223,6 +299,8 @@ public class LlamaServerService(
         throw new TimeoutException("llama-server did not become healthy within 120 seconds.");
     }
 
+    public void SetLogHandler(Action<string>? handler) => _logHandler = handler;
+
     public async Task StopAsync()
     {
         if (_serverProcess is null) return;
@@ -240,6 +318,7 @@ public class LlamaServerService(
         }
         _serverProcess.Dispose();
         _serverProcess = null;
+        _logHandler = null;
         // Wait for the OS to release the port and for the GPU driver to fully reclaim VRAM.
         // Large MoE models need longer than 500ms to unload completely.
         await Task.Delay(2000);

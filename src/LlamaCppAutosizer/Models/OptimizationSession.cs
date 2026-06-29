@@ -16,6 +16,7 @@ public class OptimizationIteration
     public BenchmarkResult Result { get; init; } = new();
     public ParameterChange? AppliedChange { get; init; }
     public bool IsBestSoFar { get; set; }
+    public string? StatusMessage { get; set; }
 }
 
 public class OptimizationSession

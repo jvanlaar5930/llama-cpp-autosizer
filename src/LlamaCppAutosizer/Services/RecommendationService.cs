@@ -91,53 +91,72 @@ public class RecommendationService(
         OptimizationSession session, OptimizationProfile profile, HardwareInfo hardware)
     {
         var best = session.BestResult!;
-        var current = session.Iterations.Last();
+        var bestSettings = session.Best!.Settings;
 
-        var history = string.Join("\n", session.Iterations.TakeLast(5).Select(i =>
-            $"  iter={i.Number} score={i.Result.CompositeScore:F3} " +
-            $"PP={i.Result.PromptProcessingRate:F0}t/s TG={i.Result.GenerationRate:F0}t/s " +
-            $"TTFT={i.Result.TimeToFirstTokenMs:F0}ms change={i.AppliedChange?.Parameter ?? "baseline"}"));
+        // Explicit per-iteration log: what was changed, did it help?
+        double baselineScore = session.Iterations[0].Result.CompositeScore;
+        var historyLines = session.Iterations.Select(i =>
+        {
+            if (i.Number == 0)
+                return $"  [baseline] score={i.Result.CompositeScore:F3}  " +
+                       $"TG={i.Result.GenerationRate:F0}t/s PP={i.Result.PromptProcessingRate:F0}t/s TTFT={i.Result.TimeToFirstTokenMs:F0}ms";
+            double delta = i.Result.CompositeScore - baselineScore;
+            string verdict = i.Result.CompositeScore >= best.CompositeScore ? "★ BEST"
+                           : delta >= 0 ? $"+{delta:F3} vs baseline"
+                           : $"{delta:F3} vs baseline (worse)";
+            return $"  [iter {i.Number}] {i.AppliedChange?.Parameter ?? "?"}={i.AppliedChange?.NewValue}  " +
+                   $"score={i.Result.CompositeScore:F3} ({verdict})  " +
+                   $"TG={i.Result.GenerationRate:F0}t/s PP={i.Result.PromptProcessingRate:F0}t/s TTFT={i.Result.TimeToFirstTokenMs:F0}ms";
+        });
 
         bool isMoe = LlamaSettings.IsMoeModel(session.ModelPath);
         string moeContext = isMoe
             ? $"\nMODEL TYPE: Mixture-of-Experts (MoE). Active experts/token: " +
-              $"{(current.Settings.MoeExpertUsed.HasValue ? current.Settings.MoeExpertUsed.Value : "model default")}. " +
+              $"{(bestSettings.MoeExpertUsed.HasValue ? bestSettings.MoeExpertUsed.Value : "model default")}. " +
               $"Reducing active experts saves VRAM and speeds inference at some quality cost."
             : "";
 
         return $$"""
-You are a llama.cpp performance optimizer. Analyze the benchmark history and suggest ONE parameter change.
+You are a llama.cpp performance optimizer. Your task is to find the best server settings for this model on this hardware by trying one change at a time.
+Study the results so far and suggest ONE parameter change most likely to improve the composite score.
+You may suggest a different value for a parameter already tried if you think another value will do better.
 
 HARDWARE:
 - GPU VRAM: {{hardware.TotalVramMb}} MB (free: {{hardware.FreeVramMb}} MB)
 - RAM: {{hardware.RamTotalMb}} MB (free: {{hardware.RamFreeMb}} MB)
 - CPU threads: {{hardware.CpuThreads}}
 
-PROFILE: {{profile.Name}} ({{profile.Description}}){{moeContext}}
+PROFILE: {{profile.Name}} — {{profile.Description}}{{moeContext}}
 
-CURRENT SETTINGS:
-- ctx-size: {{current.Settings.ContextSize}}
-- n-gpu-layers: {{current.Settings.GpuLayers}}
-- batch-size: {{current.Settings.BatchSize}}
-- ubatch-size: {{current.Settings.UBatchSize}}
-- flash-attn: {{current.Settings.FlashAttention}}
-- cache-type-k: {{current.Settings.CacheTypeK ?? "f16"}}
-- cache-type-v: {{current.Settings.CacheTypeV ?? "f16"}}
-- threads: {{current.Settings.Threads}}
+BEST SETTINGS SO FAR (score={{best.CompositeScore:F3}}):
+- ctx-size: {{bestSettings.ContextSize}}
+- n-gpu-layers: {{bestSettings.GpuLayers}} (-1 = all layers)
+- batch-size: {{bestSettings.BatchSize}}
+- ubatch-size: {{bestSettings.UBatchSize}}
+- flash-attn: {{bestSettings.FlashAttention}}
+- cache-type-k: {{bestSettings.CacheTypeK ?? "f16"}}
+- cache-type-v: {{bestSettings.CacheTypeV ?? "f16"}}
+- threads: {{bestSettings.Threads}} (-1 = auto)
 
-BENCHMARK HISTORY (last 5 iterations):
-{{history}}
+FULL OPTIMIZATION HISTORY:
+{{string.Join("\n", historyLines)}}
 
-BEST SCORE: {{best.CompositeScore:F3}}
-BEST METRICS: PP={{best.PromptProcessingRate:F0}}t/s TG={{best.GenerationRate:F0}}t/s TTFT={{best.TimeToFirstTokenMs:F0}}ms
+GOAL: Improve composite score above {{best.CompositeScore:F3}}.
+RULE: If a parameter made things worse, try something else OR a different value for it.
 
-Suggest ONE change that is likely to improve the score for the {{profile.Name}} profile.
-Valid parameters: GpuLayers (int), ContextSize (int, powers of 2), BatchSize (int), UBatchSize (int),
-FlashAttention (true/false), CacheTypeK (f16/q8_0/q4_0/q5_0), CacheTypeV (f16/q8_0/q4_0/q5_0),
-Threads (int, -1=auto), Mlock (true/false).
+Valid parameters and example values:
+- GpuLayers: -1 (all layers), or a positive integer up to 200
+- ContextSize: power of 2 — 512, 1024, 2048, 4096, 8192, 16384, 32768
+- BatchSize: 64, 128, 256, 512, 1024, 2048
+- UBatchSize: 64, 128, 256, 512, 1024
+- FlashAttention: true or false
+- CacheTypeK: "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"
+- CacheTypeV: "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"
+- Threads: -1 (auto), or 1–{{hardware.CpuThreads}}
+- Mlock: true or false
 
-Respond with ONLY this JSON (no markdown, no explanation outside JSON):
-{"parameter":"<name>","value":<value>,"reasoning":"<one sentence>"}
+Respond with ONLY this JSON (no markdown, no extra text before or after):
+{"parameter":"<name>","value":<value>,"reasoning":"<one sentence explaining why this should help>"}
 """;
     }
 
@@ -248,6 +267,7 @@ Respond with ONLY this JSON (no markdown, no explanation outside JSON):
         OptimizationProfile profile,
         HardwareInfo hardware)
     {
+        // Parameters tried so far (by name — for single-shot explorations)
         var tried = session.Iterations
             .Where(i => i.AppliedChange is not null)
             .Select(i => i.AppliedChange!.Parameter)
@@ -255,12 +275,14 @@ Respond with ONLY this JSON (no markdown, no explanation outside JSON):
 
         var best = session.BestResult!;
         var bestSettings = session.BestSettings!;
+        double baselineScore = session.Iterations[0].Result.CompositeScore;
+        bool scoreImproved = best.CompositeScore > baselineScore;
 
-        // If VRAM is available and GPU layers aren't maxed, try more GPU layers
-        if (!tried.Contains("GpuLayers") && hardware.HasGpu)
+        // If VRAM is available and GPU layers aren't already maxed (-1 = all), try more
+        if (!tried.Contains("GpuLayers") && hardware.HasGpu && bestSettings.GpuLayers != -1)
         {
-            var suggestedNgl = Math.Min(bestSettings.GpuLayers + 8, 100);
-            if (suggestedNgl != bestSettings.GpuLayers)
+            var suggestedNgl = Math.Min(bestSettings.GpuLayers + 8, 200);
+            if (suggestedNgl > bestSettings.GpuLayers)
                 return Change("GpuLayers", bestSettings.GpuLayers, suggestedNgl,
                     "More GPU layers offloads computation to VRAM, improving TG speed");
         }
@@ -290,16 +312,22 @@ Respond with ONLY this JSON (no markdown, no explanation outside JSON):
                         : "Larger batch size improves PP throughput for agentic workloads");
         }
 
-        // Increase context for agentic profile
-        if (!tried.Contains("ContextSize") && profile.Type == ProfileType.Agentic
-            && bestSettings.ContextSize < profile.TargetContextSize)
+        // Progressive context expansion — both profiles.
+        // Step up by 2× each time, but only when score has improved from baseline,
+        // and only if this specific target value hasn't already been tried.
+        if (bestSettings.ContextSize < profile.TargetContextSize && scoreImproved)
         {
-            int newCtx = Math.Min(bestSettings.ContextSize * 2, profile.TargetContextSize);
-            return Change("ContextSize", bestSettings.ContextSize, newCtx,
-                "Larger context enables longer agentic task chains");
+            int nextCtx = Math.Min(bestSettings.ContextSize * 2, profile.TargetContextSize);
+            bool alreadyTriedThisValue = session.Iterations.Any(i =>
+                i.AppliedChange?.Parameter == "ContextSize" &&
+                Convert.ToInt32(i.AppliedChange.NewValue) == nextCtx);
+
+            if (!alreadyTriedThisValue)
+                return Change("ContextSize", bestSettings.ContextSize, nextCtx,
+                    $"Score is improving — expanding context {bestSettings.ContextSize:N0} → {nextCtx:N0} tokens");
         }
 
-        // Try even more aggressive KV quant if first round helped
+        // Escalate KV quant if the first round helped
         if (tried.Contains("CacheTypeK") && bestSettings.CacheTypeK == "q8_0")
             return Change("CacheTypeK", "q8_0", "q4_0",
                 "q4_0 further reduces KV cache VRAM at some quality cost — worth testing");
@@ -311,6 +339,20 @@ Respond with ONLY this JSON (no markdown, no explanation outside JSON):
             if (suggestedThreads != bestSettings.Threads)
                 return Change("Threads", bestSettings.Threads, suggestedThreads,
                     "Tuning thread count to physical cores can reduce scheduling overhead");
+        }
+
+        // If context hasn't been expanded yet (score hasn't improved enough to trigger
+        // the gate above) but we've run out of other ideas, try it anyway as a last resort.
+        if (bestSettings.ContextSize < profile.TargetContextSize)
+        {
+            int nextCtx = Math.Min(bestSettings.ContextSize * 2, profile.TargetContextSize);
+            bool alreadyTriedThisValue = session.Iterations.Any(i =>
+                i.AppliedChange?.Parameter == "ContextSize" &&
+                Convert.ToInt32(i.AppliedChange.NewValue) == nextCtx);
+
+            if (!alreadyTriedThisValue)
+                return Change("ContextSize", bestSettings.ContextSize, nextCtx,
+                    $"Trying larger context {bestSettings.ContextSize:N0} → {nextCtx:N0} tokens as a final exploration");
         }
 
         return null; // Nothing left to try

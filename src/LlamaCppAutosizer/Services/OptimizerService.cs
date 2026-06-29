@@ -57,6 +57,7 @@ public class OptimizerService(
                 Result = baselineResult,
                 AppliedChange = null,
                 IsBestSoFar = true,
+                StatusMessage = "Baseline — establishing reference score",
             };
             session.AddIteration(baseline);
             await persistence.SaveAsync(session);
@@ -64,7 +65,6 @@ public class OptimizerService(
             yield return baseline;
 
             // ── Iterative tuning ──────────────────────────────────────────────
-            int noImprovementCount = 0;
             int consecutiveStartFailures = 0;
             const int MaxConsecutiveFailures = 3;
 
@@ -136,37 +136,19 @@ public class OptimizerService(
                     continue;
                 }
 
-                double prevBest = session.BestResult!.CompositeScore;
+                string sourceTag = change.Source == "llm" ? "LLM" : "Heuristic";
                 var iteration = new OptimizationIteration
                 {
                     Number = iter,
                     Settings = nextSettings,
                     Result = iterResult,
                     AppliedChange = change,
+                    StatusMessage = $"[{sourceTag}] {change.Parameter} → {change.NewValue}  \"{change.Reasoning}\"",
                 };
                 session.AddIteration(iteration);
                 await persistence.SaveAsync(session);
 
-                double improvement = iterResult.CompositeScore - prevBest;
-                if (improvement < options.ConvergenceThreshold)
-                {
-                    noImprovementCount++;
-                    logger.LogDebug("No significant improvement ({Delta:F3}), patience {N}/{Max}",
-                        improvement, noImprovementCount, options.ConvergencePatience);
-                }
-                else
-                {
-                    noImprovementCount = 0;
-                }
-
                 yield return iteration;
-
-                if (noImprovementCount >= options.ConvergencePatience)
-                {
-                    session.CompletionReason = $"Converged after {noImprovementCount} non-improving iterations";
-                    logger.LogInformation("Converged — stopping optimization");
-                    break;
-                }
             }
         }
         finally
@@ -203,43 +185,154 @@ public class OptimizerService(
 
     /// <summary>
     /// Build a good initial set of settings using hardware info and model size.
+    /// Uses a VRAM-tier preset table so the baseline is conservative enough to
+    /// actually start, rather than computing GPU layers with rough math that can
+    /// over-commit VRAM.
     /// </summary>
     public static LlamaSettings BuildInitialSettings(
         string modelPath, OptimizationProfile profile, HardwareInfo hw)
     {
-        var modelSizeMb = new FileInfo(modelPath).Length / (1024 * 1024);
+        long modelSizeMb = new FileInfo(modelPath).Length / (1024 * 1024);
 
-        // Rough layer estimate: most models 7B–70B have 32–80 transformer layers
+        // Rough layer count — used only to estimate MB-per-layer for ngl calculation.
         int estimatedLayers = modelSizeMb switch
         {
-            < 2000 => 24,    // ~1B
-            < 5000 => 32,    // ~3–7B
+            < 2000  => 24,   // ~1B
+            < 5000  => 32,   // ~3–7B
             < 10000 => 40,   // ~8–13B
             < 20000 => 60,   // ~14–30B
-            _ => 80,         // ~34–70B
+            _       => 80,   // ~34–70B+
         };
 
-        int gpuLayers = hw.HasGpu
-            ? hw.EstimateMaxGpuLayers(modelSizeMb, estimatedLayers)
-            : 0;
-
-        int contextSize = hw.SuggestContextSize(modelSizeMb, gpuLayers > 0);
-        // Respect the profile's target (don't exceed it initially)
-        contextSize = Math.Min(contextSize, profile.TargetContextSize);
+        double mbPerLayer = (double)modelSizeMb / estimatedLayers;
 
         int threads = hw.CpuCores > 0 ? hw.CpuCores : -1;
 
+        bool isThinking = LlamaSettings.IsThinkingModel(modelPath);
+
+        if (!hw.HasGpu)
+        {
+            // CPU-only: use RAM-based presets; no GPU offload
+            var cpuPreset = CpuPreset(hw.RamFreeMb);
+            return new LlamaSettings
+            {
+                GpuLayers      = 0,
+                ContextSize    = Math.Min(cpuPreset.CtxSize, profile.TargetContextSize),
+                BatchSize      = cpuPreset.Batch,
+                UBatchSize     = cpuPreset.UBatch,
+                Threads        = threads,
+                ThreadsBatch   = threads,
+                FlashAttention = false,
+                Mmap           = true,
+                ThinkingEnabled = isThinking ? false : null,
+                Label          = "baseline",
+            };
+        }
+
+        // GPU path — select preset tier from free VRAM
+        var preset = GpuPreset(hw.FreeVramMb);
+
+        // Calculate GPU layers: leave 'preset.ReserveMb' free for KV cache + overhead.
+        long vramForWeights = Math.Max(0, hw.FreeVramMb - preset.ReserveMb);
+        int maxLayersInVram = mbPerLayer > 0 ? (int)(vramForWeights / mbPerLayer) : estimatedLayers;
+
+        int gpuLayers = maxLayersInVram >= estimatedLayers
+            ? -1                  // entire model fits — offload all
+            : maxLayersInVram;
+
+        // Context: start from the tier default, respect profile cap.
+        // If the model barely squeezes into VRAM (< 2 GB headroom), start conservatively.
+        int contextSize = Math.Min(preset.CtxSize, profile.TargetContextSize);
+        if (gpuLayers != -1)
+        {
+            long modelVramUsed = (long)(gpuLayers * mbPerLayer);
+            long headroom = hw.FreeVramMb - modelVramUsed;
+            if      (headroom < 1536) contextSize = Math.Min(contextSize, 2048);
+            else if (headroom < 3072) contextSize = Math.Min(contextSize, 4096);
+            else if (headroom < 6144) contextSize = Math.Min(contextSize, 8192);
+        }
+
         return new LlamaSettings
         {
-            GpuLayers = gpuLayers,
-            ContextSize = contextSize,
-            BatchSize = 512,
-            UBatchSize = 512,
-            Threads = threads,
-            ThreadsBatch = threads,
-            FlashAttention = false,
-            Mmap = true,
-            Label = "baseline",
+            GpuLayers      = gpuLayers,
+            ContextSize    = contextSize,
+            BatchSize      = preset.Batch,
+            UBatchSize     = preset.UBatch,
+            Threads        = threads,
+            ThreadsBatch   = threads,
+            FlashAttention = preset.FlashAttn,
+            Mmap           = true,
+            ThinkingEnabled = isThinking ? false : null,
+            Label          = "baseline",
         };
+    }
+
+    // ── VRAM preset table ────────────────────────────────────────────────────
+    // Keyed by minimum free VRAM (MB).  When free VRAM is between two tiers
+    // the lower tier is used — this is intentionally conservative so the
+    // baseline always starts successfully.
+    //
+    // ReserveMb: VRAM held back from model weights for KV cache + driver overhead.
+    // Higher tiers get more reserve because they run larger contexts.
+
+    private readonly record struct GpuTier(
+        int MinVramMb, int ReserveMb, int CtxSize, bool FlashAttn, int Batch, int UBatch);
+
+    private static readonly GpuTier[] GpuTiers =
+    [
+        new(     0,   512,  2048, false,  256,  256),  //  < 4 GB  (iGPU / very old dGPU)
+        new(  4096,   768,  2048,  true,  256,  256),  //    4 GB  (GTX 1050 Ti, GTX 1650)
+        new(  6144,  1024,  4096,  true,  256,  256),  //    6 GB  (RTX 2060, GTX 1060)
+        new(  8192,  1536,  4096,  true,  512,  512),  //    8 GB  (RTX 3070, RX 6700 XT)
+        new( 10240,  1536,  8192,  true,  512,  512),  //   10 GB  (RTX 3080 10GB)
+        new( 12288,  2048,  8192,  true,  512,  512),  //   12 GB  (RTX 3060, RTX 4070)
+        new( 16384,  2560, 16384,  true,  512,  512),  //   16 GB  (RX 6800, RTX 4080)
+        new( 20480,  3072, 16384,  true,  512,  512),  //   20 GB  (RTX 3080 20GB)
+        new( 24576,  3584, 32768,  true,  512,  512),  //   24 GB  (RTX 3090 / 4090, A5000)
+        new( 32768,  4096, 32768,  true, 1024,  512),  //   32 GB  (RTX 6000 Ada, A6000 48-32)
+        new( 49152,  6144, 65536,  true, 1024, 1024),  //   48 GB  (RTX A6000, L40)
+        new( 65536,  8192, 131072, true, 2048, 1024),  //   64 GB+ (A100, H100)
+    ];
+
+    private static (int ReserveMb, int CtxSize, bool FlashAttn, int Batch, int UBatch)
+        GpuPreset(long freeVramMb)
+    {
+        // Walk backwards to find the highest tier that doesn't exceed free VRAM.
+        for (int i = GpuTiers.Length - 1; i >= 0; i--)
+        {
+            if (freeVramMb >= GpuTiers[i].MinVramMb)
+            {
+                var t = GpuTiers[i];
+                return (t.ReserveMb, t.CtxSize, t.FlashAttn, t.Batch, t.UBatch);
+            }
+        }
+        var fallback = GpuTiers[0];
+        return (fallback.ReserveMb, fallback.CtxSize, fallback.FlashAttn, fallback.Batch, fallback.UBatch);
+    }
+
+    // CPU-only preset: context is the scarce resource (RAM-limited), no flash attention.
+    private readonly record struct CpuTier(int MinRamMb, int CtxSize, int Batch, int UBatch);
+
+    private static readonly CpuTier[] CpuTiers =
+    [
+        new(     0,  2048,  64,  64),   //  < 8 GB RAM
+        new(  8192,  4096, 128, 128),   //    8 GB RAM
+        new( 16384,  8192, 256, 256),   //   16 GB RAM
+        new( 32768, 16384, 512, 256),   //   32 GB RAM
+        new( 65536, 32768, 512, 512),   //   64 GB RAM
+    ];
+
+    private static (int CtxSize, int Batch, int UBatch) CpuPreset(long freeRamMb)
+    {
+        for (int i = CpuTiers.Length - 1; i >= 0; i--)
+        {
+            if (freeRamMb >= CpuTiers[i].MinRamMb)
+            {
+                var t = CpuTiers[i];
+                return (t.CtxSize, t.Batch, t.UBatch);
+            }
+        }
+        var fallback = CpuTiers[0];
+        return (fallback.CtxSize, fallback.Batch, fallback.UBatch);
     }
 }

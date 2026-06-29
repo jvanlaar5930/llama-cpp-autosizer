@@ -298,7 +298,7 @@ public class MainMenu(
         AnsiConsole.WriteLine();
         int maxIter = AnsiConsole.Prompt(
             new TextPrompt<int>("Max optimization iterations:")
-                .DefaultValue(15)
+                .DefaultValue(20)
                 .Validate(v => v >= 2 && v <= 50
                     ? ValidationResult.Success()
                     : ValidationResult.Error("Must be 2–50")));
@@ -337,13 +337,24 @@ public class MainMenu(
             })
             .StartAsync(async ctx =>
             {
-                var task = ctx.AddTask($"[cyan]Optimizing {session.ModelName}[/]", maxValue: maxIter);
+                // +1 for the baseline (iter 0) which is also yielded
+                var task = ctx.AddTask($"[cyan]Optimizing {session.ModelName}[/]", maxValue: maxIter + 1);
 
                 await foreach (var iter in iterations.WithCancellation(cts.Token))
                 {
                     task.Increment(1);
-                    task.Description = $"[cyan]iter {iter.Number}/{maxIter}[/] score=[green]{iter.Result.CompositeScore:F3}[/] " +
-                        $"TG=[cyan]{iter.Result.GenerationRate:F1}t/s[/]";
+
+                    string bestMark = iter.IsBestSoFar ? " [bold green]★ best[/]" : "";
+                    string scoreStr = $"score=[green]{iter.Result.CompositeScore:F3}[/] TG=[cyan]{iter.Result.GenerationRate:F1}t/s[/] PP=[cyan]{iter.Result.PromptProcessingRate:F0}t/s[/]";
+
+                    // Escape any Spectre markup chars that may appear in LLM reasoning
+                    string statusLine = iter.StatusMessage is not null
+                        ? Markup.Escape(iter.StatusMessage)
+                        : "";
+
+                    task.Description =
+                        $"[grey]iter {iter.Number}/{maxIter}[/]  {scoreStr}{bestMark}\n" +
+                        $"  [grey]{statusLine}[/]";
                 }
             });
 

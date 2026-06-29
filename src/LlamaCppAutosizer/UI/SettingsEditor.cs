@@ -13,6 +13,7 @@ public static class SettingsEditor
     {
         var s = settings.Clone();
         bool isMoe = LlamaSettings.IsMoeModel(modelPath);
+        bool isThinking = LlamaSettings.IsThinkingModel(modelPath);
 
         while (true)
         {
@@ -20,7 +21,7 @@ public static class SettingsEditor
             AnsiConsole.Write(new Rule($"[bold yellow]{title}[/]").RuleStyle("yellow"));
             AnsiConsole.WriteLine();
 
-            RenderSettings(s, isMoe);
+            RenderSettings(s, isMoe, isThinking);
             AnsiConsole.WriteLine();
 
             var baseChoices = new List<string>
@@ -43,6 +44,8 @@ public static class SettingsEditor
             };
             if (isMoe)
                 baseChoices.Insert(baseChoices.Count - 1, "MoE: Active Expert Count");
+            if (isThinking)
+                baseChoices.Insert(baseChoices.Count - 1, "Thinking Mode (CoT)");
             baseChoices.Add("-- Reset to defaults --");
 
             var choice = AnsiConsole.Prompt(
@@ -108,6 +111,17 @@ public static class SettingsEditor
                         "Active experts per token (0 = use model default, e.g. 8 for Mixtral 8x7B)", defaultExperts, 0, 256);
                     s.MoeExpertUsed = newExperts == 0 ? null : newExperts;
                     break;
+                case "Thinking Mode (CoT)":
+                {
+                    var options = new[] { "model default", "enabled", "disabled" };
+                    string current = s.ThinkingEnabled switch { true => "enabled", false => "disabled", _ => "model default" };
+                    var picked = AnsiConsole.Prompt(
+                        new SelectionPrompt<string>()
+                            .Title($"[grey]Thinking/CoT mode[/] (current: [cyan]{current}[/])")
+                            .AddChoices(options));
+                    s.ThinkingEnabled = picked switch { "enabled" => true, "disabled" => false, _ => null };
+                    break;
+                }
                 case "Rope Scaling":
                     s.RopeScaling = PromptOptionalString("RoPE scaling type (none/linear/yarn, empty to clear)",
                         s.RopeScaling);
@@ -124,7 +138,7 @@ public static class SettingsEditor
     }
 
     /// <summary>Displays a read-only summary of the settings in a formatted table.</summary>
-    public static void RenderSettings(LlamaSettings s, bool showMoe = false)
+    public static void RenderSettings(LlamaSettings s, bool showMoe = false, bool showThinking = false)
     {
         var table = new Table().Border(TableBorder.Rounded).BorderColor(Color.Grey);
         table.AddColumn("[grey]Parameter[/]");
@@ -146,6 +160,11 @@ public static class SettingsEditor
 
         if (showMoe || s.MoeExpertUsed.HasValue)
             table.AddRow("experts (MoE)", $"[cyan]{(s.MoeExpertUsed.HasValue ? s.MoeExpertUsed.Value : "model default")}[/]", "active experts/token");
+        if (showThinking || s.ThinkingEnabled.HasValue)
+        {
+            string thinkVal = s.ThinkingEnabled switch { true => "[green]enabled[/]", false => "[grey]disabled[/]", _ => "[grey]model default[/]" };
+            table.AddRow("thinking (CoT)", thinkVal, "chain-of-thought");
+        }
         if (s.RopeScaling is not null)
             table.AddRow("rope-scaling", $"[cyan]{s.RopeScaling}[/]", "");
         if (!string.IsNullOrWhiteSpace(s.ExtraArgs))

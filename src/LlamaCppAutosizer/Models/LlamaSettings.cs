@@ -28,6 +28,11 @@ public class LlamaSettings
     // Reduces active experts per token; null = use the model's built-in default
     public int? MoeExpertUsed { get; set; }
 
+    // Thinking / chain-of-thought mode — only meaningful for thinking-capable models
+    // (Qwen3, DeepSeek-R1, QwQ). null = model default (usually enabled).
+    // false = disable thinking (shorter, faster responses); true = force enable.
+    public bool? ThinkingEnabled { get; set; }
+
     // Concurrency / defrag
     public int ParallelSlots { get; set; } = 1;
     public float DefragThreshold { get; set; } = -1f;   // -1 = disabled
@@ -66,6 +71,7 @@ public class LlamaSettings
         if (CacheTypeK is not null) { args.Add("--cache-type-k"); args.Add(CacheTypeK); }
         if (CacheTypeV is not null) { args.Add("--cache-type-v"); args.Add(CacheTypeV); }
         if (MoeExpertUsed.HasValue) { args.Add("--override-kv"); args.Add($"tokenizer.ggml.n_expert_used=int:{MoeExpertUsed.Value}"); }
+        if (ThinkingEnabled.HasValue) { args.Add("--override-kv"); args.Add($"tokenizer.ggml.enable_thinking=bool:{ThinkingEnabled.Value.ToString().ToLower()}"); }
         if (DefragThreshold >= 0) { args.Add("--defrag-thold"); args.Add(DefragThreshold.ToString("F2")); }
         if (RopeScaling is not null) { args.Add("--rope-scaling"); args.Add(RopeScaling); }
         if (RopeFreqBase.HasValue) { args.Add("--rope-freq-base"); args.Add(RopeFreqBase.Value.ToString()); }
@@ -94,6 +100,20 @@ public class LlamaSettings
                 $"threads={Threads}/{ThreadsBatch}";
         if (MoeExpertUsed.HasValue) s += $" experts={MoeExpertUsed.Value}";
         return s;
+    }
+
+    /// <summary>Detects models that support chain-of-thought "thinking" mode.</summary>
+    public static bool IsThinkingModel(string? modelPath)
+    {
+        if (string.IsNullOrEmpty(modelPath)) return false;
+        var name = Path.GetFileName(modelPath).ToLowerInvariant();
+        // Qwen3.x family (NOT Qwen2.5 — it doesn't have thinking mode)
+        if (System.Text.RegularExpressions.Regex.IsMatch(name, @"qwen3[\.\-_]")) return true;
+        // QwQ (thinking model from Qwen team)
+        if (name.StartsWith("qwq") || name.Contains("-qwq")) return true;
+        // DeepSeek-R1 and its distillations
+        if (name.Contains("deepseek-r1") || name.Contains("deepseek_r1")) return true;
+        return false;
     }
 
     /// <summary>Detects likely MoE architectures from the model filename.</summary>
