@@ -22,135 +22,167 @@ public class OptimizerService(
     /// Main optimization loop. Yields each completed iteration so the UI can
     /// display live progress. Call StopAsync() on the token to abort early.
     /// </summary>
+    /// <summary>
+    /// Main optimization loop. The caller provides the <paramref name="session"/> so that
+    /// CompletionReason, IsComplete, and iteration history all land on the same object used
+    /// for the final display — no session duplication.
+    /// </summary>
     public async IAsyncEnumerable<OptimizationIteration> OptimizeAsync(
         string serverExecutable,
         string modelPath,
         LlamaSettings initialSettings,
         OptimizationProfile profile,
+        OptimizationSession session,
         OptimizationOptions? options = null,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         options ??= new OptimizationOptions();
         var hw = await hardware.DetectAsync();
+        session.Hardware = hw;
 
-        var session = new OptimizationSession
+        try
         {
-            ModelPath = modelPath,
-            Profile = profile.Type,
-            Hardware = hw,
-        };
+            // ── Iteration 0: baseline ─────────────────────────────────────────
+            logger.LogInformation("Starting baseline benchmark");
+            await StartServerAsync(serverExecutable, modelPath, initialSettings, options.Port, ct);
 
-        // ── Iteration 0: baseline ───────────────────────────────────────────
-        logger.LogInformation("Starting baseline benchmark");
-        await StartServerAsync(serverExecutable, modelPath, initialSettings, options.Port, ct);
+            var baselineResult = await benchmarks.RunAsync(initialSettings, modelPath, profile, ct);
+            baselineResult.CompositeScore = profile.ScoreResult(baselineResult);
+            baselineResult.Notes = "Baseline";
 
-        var baselineResult = await benchmarks.RunAsync(initialSettings, modelPath, profile, ct);
-        baselineResult.CompositeScore = profile.ScoreResult(baselineResult);
-        baselineResult.Notes = "Baseline";
-
-        var baseline = new OptimizationIteration
-        {
-            Number = 0,
-            Settings = initialSettings.Clone(),
-            Result = baselineResult,
-            AppliedChange = null,
-            IsBestSoFar = true,
-        };
-        session.AddIteration(baseline);
-        await persistence.SaveAsync(session);
-
-        yield return baseline;
-
-        // ── Iterative tuning ────────────────────────────────────────────────
-        int noImprovementCount = 0;
-
-        for (int iter = 1; iter <= options.MaxIterations && !ct.IsCancellationRequested; iter++)
-        {
-            var change = await recommender.GetNextRecommendationAsync(session, profile, hw, ct);
-            if (change is null)
+            var baseline = new OptimizationIteration
             {
-                logger.LogInformation("No more recommendations — stopping");
-                session.CompletionReason = "All candidate parameters explored";
-                break;
-            }
-
-            var nextSettings = RecommendationService.Apply(session.BestSettings!, change);
-            nextSettings.Label = $"iter{iter}";
-
-            logger.LogInformation(
-                "Iteration {N}: trying {Param} = {Val} ({Source})",
-                iter, change.Parameter, change.NewValue, change.Source);
-
-            // Restart server with new settings
-            await StopServerAsync();
-            try
-            {
-                await StartServerAsync(serverExecutable, modelPath, nextSettings, options.Port, ct);
-            }
-            catch (Exception ex)
-            {
-                logger.LogWarning("Server failed to start with new settings: {Msg}", ex.Message);
-                // Revert to best settings and continue
-                await StartServerAsync(serverExecutable, modelPath, session.BestSettings!, options.Port, ct);
-                continue;
-            }
-
-            BenchmarkResult iterResult;
-            try
-            {
-                iterResult = await benchmarks.RunAsync(nextSettings, modelPath, profile, ct);
-                iterResult.CompositeScore = profile.ScoreResult(iterResult);
-            }
-            catch (Exception ex)
-            {
-                logger.LogWarning("Benchmark failed: {Msg}", ex.Message);
-                continue;
-            }
-
-            double prevBest = session.BestResult!.CompositeScore;
-            var iteration = new OptimizationIteration
-            {
-                Number = iter,
-                Settings = nextSettings,
-                Result = iterResult,
-                AppliedChange = change,
+                Number = 0,
+                Settings = initialSettings.Clone(),
+                Result = baselineResult,
+                AppliedChange = null,
+                IsBestSoFar = true,
             };
-            session.AddIteration(iteration);
+            session.AddIteration(baseline);
             await persistence.SaveAsync(session);
 
-            double improvement = iterResult.CompositeScore - prevBest;
-            if (improvement < options.ConvergenceThreshold)
-            {
-                noImprovementCount++;
-                logger.LogDebug("No significant improvement ({Delta:F3}), patience {N}/{Max}",
-                    improvement, noImprovementCount, options.ConvergencePatience);
-            }
-            else
-            {
-                noImprovementCount = 0;
-            }
+            yield return baseline;
 
-            yield return iteration;
+            // ── Iterative tuning ──────────────────────────────────────────────
+            int noImprovementCount = 0;
+            int consecutiveStartFailures = 0;
+            const int MaxConsecutiveFailures = 3;
 
-            if (noImprovementCount >= options.ConvergencePatience)
+            for (int iter = 1; iter <= options.MaxIterations && !ct.IsCancellationRequested; iter++)
             {
-                session.CompletionReason = $"Converged after {noImprovementCount} non-improving iterations";
-                logger.LogInformation("Converged — stopping optimization");
-                break;
+                var change = await recommender.GetNextRecommendationAsync(session, profile, hw, ct);
+                if (change is null)
+                {
+                    logger.LogInformation("No more recommendations — stopping");
+                    session.CompletionReason = "All candidate parameters explored";
+                    break;
+                }
+
+                var nextSettings = RecommendationService.Apply(session.BestSettings!, change);
+                nextSettings.Label = $"iter{iter}";
+
+                logger.LogInformation(
+                    "Iteration {N}: trying {Param} = {Val} ({Source})",
+                    iter, change.Parameter, change.NewValue, change.Source);
+
+                // Restart server with new settings
+                await StopServerAsync();
+                bool started = false;
+                try
+                {
+                    await StartServerAsync(serverExecutable, modelPath, nextSettings, options.Port, ct);
+                    started = true;
+                    consecutiveStartFailures = 0;
+                }
+                catch (Exception ex)
+                {
+                    consecutiveStartFailures++;
+                    logger.LogInformation(
+                        "Server rejected {Param}={Val} ({Reason}); reverting to best settings",
+                        change.Parameter, change.NewValue, ex.Message);
+
+                    // Revert — if revert also fails, stop cleanly rather than propagate
+                    try
+                    {
+                        await StartServerAsync(serverExecutable, modelPath, session.BestSettings!, options.Port, ct);
+                    }
+                    catch (Exception revEx)
+                    {
+                        logger.LogInformation("Server could not revert either ({Reason}); stopping optimization", revEx.Message);
+                        session.CompletionReason = "Server failed to restart — optimization stopped early";
+                        break;
+                    }
+                }
+
+                if (!started)
+                {
+                    if (consecutiveStartFailures >= MaxConsecutiveFailures)
+                    {
+                        session.CompletionReason = $"Server rejected {consecutiveStartFailures} consecutive setting changes — stopping";
+                        break;
+                    }
+                    continue;
+                }
+
+                BenchmarkResult iterResult;
+                try
+                {
+                    iterResult = await benchmarks.RunAsync(nextSettings, modelPath, profile, ct);
+                    iterResult.CompositeScore = profile.ScoreResult(iterResult);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogInformation("Benchmark failed ({Reason}); skipping iteration", ex.Message);
+                    continue;
+                }
+
+                double prevBest = session.BestResult!.CompositeScore;
+                var iteration = new OptimizationIteration
+                {
+                    Number = iter,
+                    Settings = nextSettings,
+                    Result = iterResult,
+                    AppliedChange = change,
+                };
+                session.AddIteration(iteration);
+                await persistence.SaveAsync(session);
+
+                double improvement = iterResult.CompositeScore - prevBest;
+                if (improvement < options.ConvergenceThreshold)
+                {
+                    noImprovementCount++;
+                    logger.LogDebug("No significant improvement ({Delta:F3}), patience {N}/{Max}",
+                        improvement, noImprovementCount, options.ConvergencePatience);
+                }
+                else
+                {
+                    noImprovementCount = 0;
+                }
+
+                yield return iteration;
+
+                if (noImprovementCount >= options.ConvergencePatience)
+                {
+                    session.CompletionReason = $"Converged after {noImprovementCount} non-improving iterations";
+                    logger.LogInformation("Converged — stopping optimization");
+                    break;
+                }
             }
         }
+        finally
+        {
+            // Always runs — even if an unexpected exception exits the loop
+            session.IsComplete = true;
+            session.CompletedAt = DateTime.UtcNow;
+            session.CompletionReason ??= ct.IsCancellationRequested
+                ? "Cancelled by user"
+                : "Max iterations reached";
 
-        // ── Finalize ────────────────────────────────────────────────────────
-        session.IsComplete = true;
-        session.CompletedAt = DateTime.UtcNow;
-        session.CompletionReason ??= ct.IsCancellationRequested
-            ? "Cancelled by user"
-            : "Max iterations reached";
+            await persistence.SaveAsync(session);
+            await StopServerAsync();
 
-        await persistence.SaveAsync(session);
-        await StopServerAsync();
-
-        logger.LogInformation("Optimization complete. Best score: {Score:F3}", session.BestResult?.CompositeScore ?? 0);
+            logger.LogInformation("Optimization complete. Best score: {Score:F3}", session.BestResult?.CompositeScore ?? 0);
+        }
     }
 
     // -------------------------------------------------------------------------

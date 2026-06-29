@@ -101,15 +101,23 @@ public class LlamaSettings
     {
         if (string.IsNullOrEmpty(modelPath)) return false;
         var name = Path.GetFileName(modelPath).ToLowerInvariant();
-        return name.Contains("mixtral") ||
-               name.Contains("moe") ||
-               name.Contains("dbrx") ||
-               name.Contains("grok") ||
-               name.Contains("deepseek") ||  // DeepSeek-V2/V3/R1 are all MoE
-               name.Contains("qwen2-moe") ||
-               name.Contains("arctic") ||
-               name.Contains("jamba") ||
-               name.Contains("olmoe");
+
+        // Explicit MoE names
+        if (name.Contains("mixtral") ||
+            name.Contains("moe") ||
+            name.Contains("dbrx") ||
+            name.Contains("grok") ||
+            name.Contains("deepseek") ||   // DeepSeek-V2/V3/R1 are all MoE
+            name.Contains("arctic") ||
+            name.Contains("jamba") ||
+            name.Contains("olmoe")) return true;
+
+        // Qwen "Active-NB" notation: e.g. Qwen3.6-35B-A3B, Qwen2-57B-A14B
+        // Pattern: <total>B-A<active>B — the A<n>B suffix only appears on MoE variants
+        if (System.Text.RegularExpressions.Regex.IsMatch(name, @"\d+b-a\d+b"))
+            return true;
+
+        return false;
     }
 
     // Standard llama.cpp types + turbo* types from the TurboQuant fork

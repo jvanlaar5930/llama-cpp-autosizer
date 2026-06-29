@@ -304,11 +304,14 @@ public class MainMenu(
                     : ValidationResult.Error("Must be 2–50")));
 
         var opts = new OptimizationOptions(MaxIterations: maxIter);
+
+        // Single session shared with the optimizer — CompletionReason and iteration history
+        // are written directly to this object, so the final display is always correct.
         var session = new OptimizationSession
         {
             ModelPath = _modelPath,
             Profile = _profile.Type,
-            Hardware = _hardware,
+            Hardware = _hardware,   // optimizer will refresh this with a live DetectAsync
         };
 
         AnsiConsole.Clear();
@@ -319,11 +322,10 @@ public class MainMenu(
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
+        // Optimizer writes iterations into session directly; we only read them here for the UI.
         var iterations = optimizer.OptimizeAsync(
-            _serverExecutable, _modelPath, initialSettings, _profile, opts, cts.Token);
+            _serverExecutable, _modelPath, initialSettings, _profile, session, opts, cts.Token);
 
-        // Collect to session while displaying live
-        var allIter = new List<OptimizationIteration>();
         await AnsiConsole.Progress()
             .AutoClear(false)
             .Columns(new ProgressColumn[]
@@ -339,8 +341,6 @@ public class MainMenu(
 
                 await foreach (var iter in iterations.WithCancellation(cts.Token))
                 {
-                    allIter.Add(iter);
-                    session.AddIteration(iter);
                     task.Increment(1);
                     task.Description = $"[cyan]iter {iter.Number}/{maxIter}[/] score=[green]{iter.Result.CompositeScore:F3}[/] " +
                         $"TG=[cyan]{iter.Result.GenerationRate:F1}t/s[/]";

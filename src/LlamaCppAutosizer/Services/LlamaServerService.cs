@@ -240,8 +240,9 @@ public class LlamaServerService(
         }
         _serverProcess.Dispose();
         _serverProcess = null;
-        // Brief pause to allow OS to release port
-        await Task.Delay(500);
+        // Wait for the OS to release the port and for the GPU driver to fully reclaim VRAM.
+        // Large MoE models need longer than 500ms to unload completely.
+        await Task.Delay(2000);
     }
 
     public async Task<(CompletionResponse response, double ttftMs)> CompleteAsync(
