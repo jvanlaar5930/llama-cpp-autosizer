@@ -9,9 +9,10 @@ public static class SettingsEditor
     /// Interactively lets the user review and override any LlamaSettings field.
     /// Returns the (possibly modified) settings.
     /// </summary>
-    public static LlamaSettings Edit(LlamaSettings settings, string title = "Edit Settings")
+    public static LlamaSettings Edit(LlamaSettings settings, string title = "Edit Settings", string? modelPath = null)
     {
         var s = settings.Clone();
+        bool isMoe = LlamaSettings.IsMoeModel(modelPath);
 
         while (true)
         {
@@ -19,31 +20,36 @@ public static class SettingsEditor
             AnsiConsole.Write(new Rule($"[bold yellow]{title}[/]").RuleStyle("yellow"));
             AnsiConsole.WriteLine();
 
-            RenderSettings(s);
+            RenderSettings(s, isMoe);
             AnsiConsole.WriteLine();
+
+            var baseChoices = new List<string>
+            {
+                "-- Done (use these settings) --",
+                "Context Size",
+                "GPU Layers (-1 = all)",
+                "Batch Size",
+                "Micro-Batch Size (ubatch)",
+                "CPU Threads (-1 = auto)",
+                "CPU Threads for Batch (-1 = auto)",
+                "Flash Attention",
+                "Memory-map model (mmap)",
+                "Lock model in RAM (mlock)",
+                "KV Cache Type K",
+                "KV Cache Type V",
+                "Parallel Slots",
+                "Rope Scaling",
+                "Extra CLI Args (raw)",
+            };
+            if (isMoe)
+                baseChoices.Insert(baseChoices.Count - 1, "MoE: Active Expert Count");
+            baseChoices.Add("-- Reset to defaults --");
 
             var choice = AnsiConsole.Prompt(
                 new SelectionPrompt<string>()
                     .Title("[grey]Select a setting to edit, or confirm:[/]")
                     .PageSize(20)
-                    .AddChoices(
-                        "-- Done (use these settings) --",
-                        "Context Size",
-                        "GPU Layers (-1 = all)",
-                        "Batch Size",
-                        "Micro-Batch Size (ubatch)",
-                        "CPU Threads (-1 = auto)",
-                        "CPU Threads for Batch (-1 = auto)",
-                        "Flash Attention",
-                        "Memory-map model (mmap)",
-                        "Lock model in RAM (mlock)",
-                        "KV Cache Type K",
-                        "KV Cache Type V",
-                        "Parallel Slots",
-                        "Rope Scaling",
-                        "Extra CLI Args (raw)",
-                        "-- Reset to defaults --"
-                    ));
+                    .AddChoices(baseChoices));
 
             if (choice.StartsWith("-- Done")) break;
             if (choice.StartsWith("-- Reset"))
@@ -94,6 +100,14 @@ public static class SettingsEditor
                 case "Parallel Slots":
                     s.ParallelSlots = PromptInt("Parallel slots (concurrent requests)", s.ParallelSlots, 1, 16);
                     break;
+                case "MoE: Active Expert Count":
+                    // null = use model default; reducing expert count lowers memory and speeds
+                    // inference at the cost of quality (e.g. 8 → 4 on a 256-expert model)
+                    int defaultExperts = s.MoeExpertUsed ?? 0;
+                    int newExperts = PromptInt(
+                        "Active experts per token (0 = use model default, e.g. 8 for Mixtral 8x7B)", defaultExperts, 0, 256);
+                    s.MoeExpertUsed = newExperts == 0 ? null : newExperts;
+                    break;
                 case "Rope Scaling":
                     s.RopeScaling = PromptOptionalString("RoPE scaling type (none/linear/yarn, empty to clear)",
                         s.RopeScaling);
@@ -110,7 +124,7 @@ public static class SettingsEditor
     }
 
     /// <summary>Displays a read-only summary of the settings in a formatted table.</summary>
-    public static void RenderSettings(LlamaSettings s)
+    public static void RenderSettings(LlamaSettings s, bool showMoe = false)
     {
         var table = new Table().Border(TableBorder.Rounded).BorderColor(Color.Grey);
         table.AddColumn("[grey]Parameter[/]");
@@ -130,6 +144,8 @@ public static class SettingsEditor
         table.AddRow("cache-type-v", $"[cyan]{s.CacheTypeV ?? "f16"}[/]", "KV cache V type");
         table.AddRow("parallel", $"[cyan]{s.ParallelSlots}[/]", "concurrent slots");
 
+        if (showMoe || s.MoeExpertUsed.HasValue)
+            table.AddRow("experts (MoE)", $"[cyan]{(s.MoeExpertUsed.HasValue ? s.MoeExpertUsed.Value : "model default")}[/]", "active experts/token");
         if (s.RopeScaling is not null)
             table.AddRow("rope-scaling", $"[cyan]{s.RopeScaling}[/]", "");
         if (!string.IsNullOrWhiteSpace(s.ExtraArgs))

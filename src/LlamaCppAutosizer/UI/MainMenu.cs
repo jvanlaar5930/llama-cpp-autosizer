@@ -289,11 +289,11 @@ public class MainMenu(
 
         // Show and allow override
         AnsiConsole.Write(new Rule("[bold]Initial Settings (estimated)[/]").RuleStyle("yellow"));
-        SettingsEditor.RenderSettings(initialSettings);
+        SettingsEditor.RenderSettings(initialSettings, LlamaSettings.IsMoeModel(_modelPath));
         AnsiConsole.WriteLine();
 
         if (AnsiConsole.Confirm("Override any settings before starting?", false))
-            initialSettings = SettingsEditor.Edit(initialSettings, "Starting Settings");
+            initialSettings = SettingsEditor.Edit(initialSettings, "Starting Settings", _modelPath);
 
         AnsiConsole.WriteLine();
         int maxIter = AnsiConsole.Prompt(
@@ -371,7 +371,7 @@ public class MainMenu(
 
     private void EditSettingsManually()
     {
-        _manualSettings = SettingsEditor.Edit(_manualSettings, "Manual Settings Editor");
+        _manualSettings = SettingsEditor.Edit(_manualSettings, "Manual Settings Editor", _modelPath);
         AnsiConsole.MarkupLine("[green]Settings updated.[/]");
 
         if (string.IsNullOrEmpty(_modelPath) || !File.Exists(_modelPath))

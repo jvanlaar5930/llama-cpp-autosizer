@@ -98,6 +98,13 @@ public class RecommendationService(
             $"PP={i.Result.PromptProcessingRate:F0}t/s TG={i.Result.GenerationRate:F0}t/s " +
             $"TTFT={i.Result.TimeToFirstTokenMs:F0}ms change={i.AppliedChange?.Parameter ?? "baseline"}"));
 
+        bool isMoe = LlamaSettings.IsMoeModel(session.ModelPath);
+        string moeContext = isMoe
+            ? $"\nMODEL TYPE: Mixture-of-Experts (MoE). Active experts/token: " +
+              $"{(current.Settings.MoeExpertUsed.HasValue ? current.Settings.MoeExpertUsed.Value : "model default")}. " +
+              $"Reducing active experts saves VRAM and speeds inference at some quality cost."
+            : "";
+
         return $$"""
 You are a llama.cpp performance optimizer. Analyze the benchmark history and suggest ONE parameter change.
 
@@ -106,7 +113,7 @@ HARDWARE:
 - RAM: {{hardware.RamTotalMb}} MB (free: {{hardware.RamFreeMb}} MB)
 - CPU threads: {{hardware.CpuThreads}}
 
-PROFILE: {{profile.Name}} ({{profile.Description}})
+PROFILE: {{profile.Name}} ({{profile.Description}}){{moeContext}}
 
 CURRENT SETTINGS:
 - ctx-size: {{current.Settings.ContextSize}}

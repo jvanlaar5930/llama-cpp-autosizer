@@ -24,6 +24,10 @@ public class LlamaSettings
     public string? CacheTypeK { get; set; }
     public string? CacheTypeV { get; set; }
 
+    // MoE (Mixture of Experts) — only meaningful for MoE architectures
+    // Reduces active experts per token; null = use the model's built-in default
+    public int? MoeExpertUsed { get; set; }
+
     // Concurrency / defrag
     public int ParallelSlots { get; set; } = 1;
     public float DefragThreshold { get; set; } = -1f;   // -1 = disabled
@@ -61,6 +65,7 @@ public class LlamaSettings
         if (Mlock) args.Add("--mlock");
         if (CacheTypeK is not null) { args.Add("--cache-type-k"); args.Add(CacheTypeK); }
         if (CacheTypeV is not null) { args.Add("--cache-type-v"); args.Add(CacheTypeV); }
+        if (MoeExpertUsed.HasValue) { args.Add("--override-kv"); args.Add($"tokenizer.ggml.n_expert_used=int:{MoeExpertUsed.Value}"); }
         if (DefragThreshold >= 0) { args.Add("--defrag-thold"); args.Add(DefragThreshold.ToString("F2")); }
         if (RopeScaling is not null) { args.Add("--rope-scaling"); args.Add(RopeScaling); }
         if (RopeFreqBase.HasValue) { args.Add("--rope-freq-base"); args.Add(RopeFreqBase.Value.ToString()); }
@@ -83,9 +88,29 @@ public class LlamaSettings
 
     /// <summary>Human-readable summary of key parameters.</summary>
     public string Summary()
-        => $"ctx={ContextSize} ngl={GpuLayers} batch={BatchSize}/{UBatchSize} " +
-           $"fa={FlashAttention} kv={CacheTypeK ?? "f16"}/{CacheTypeV ?? "f16"} " +
-           $"threads={Threads}/{ThreadsBatch}";
+    {
+        var s = $"ctx={ContextSize} ngl={GpuLayers} batch={BatchSize}/{UBatchSize} " +
+                $"fa={FlashAttention} kv={CacheTypeK ?? "f16"}/{CacheTypeV ?? "f16"} " +
+                $"threads={Threads}/{ThreadsBatch}";
+        if (MoeExpertUsed.HasValue) s += $" experts={MoeExpertUsed.Value}";
+        return s;
+    }
+
+    /// <summary>Detects likely MoE architectures from the model filename.</summary>
+    public static bool IsMoeModel(string? modelPath)
+    {
+        if (string.IsNullOrEmpty(modelPath)) return false;
+        var name = Path.GetFileName(modelPath).ToLowerInvariant();
+        return name.Contains("mixtral") ||
+               name.Contains("moe") ||
+               name.Contains("dbrx") ||
+               name.Contains("grok") ||
+               name.Contains("deepseek") ||  // DeepSeek-V2/V3/R1 are all MoE
+               name.Contains("qwen2-moe") ||
+               name.Contains("arctic") ||
+               name.Contains("jamba") ||
+               name.Contains("olmoe");
+    }
 
     // Standard llama.cpp types + turbo* types from the TurboQuant fork
     public static readonly string[] ValidCacheTypes =
