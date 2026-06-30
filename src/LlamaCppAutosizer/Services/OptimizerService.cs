@@ -65,65 +65,110 @@ public class OptimizerService(
             yield return baseline;
 
             // ── Iterative tuning ──────────────────────────────────────────────
+            // consecutiveNonImprovements: resets on any iteration that beats the best score.
+            // When it hits 3 we ask the LLM for a completely fresh angle ("final push").
+            // If the LLM says DONE → stop early. Otherwise reset the counter and continue.
+            // We never stop just because the normal recommendation pool is exhausted —
+            // instead we trigger the final-push path there too.
+            int consecutiveNonImprovements = 0;
             int consecutiveStartFailures = 0;
-            const int MaxConsecutiveFailures = 3;
+            const int MaxConsecutiveNonImprovements = 3;
+            const int MaxConsecutiveStartFailures = 5;
 
             for (int iter = 1; iter <= options.MaxIterations && !ct.IsCancellationRequested; iter++)
             {
-                var change = await recommender.GetNextRecommendationAsync(session, profile, hw, ct);
-                if (change is null)
+                // ── Pick the next change to try ───────────────────────────────
+                ParameterChange? change;
+
+                if (consecutiveNonImprovements >= MaxConsecutiveNonImprovements)
                 {
-                    logger.LogInformation("No more recommendations — stopping");
-                    session.CompletionReason = "All candidate parameters explored";
-                    break;
+                    // 3 consecutive non-improvements: present best to LLM and ask for a new angle
+                    consecutiveNonImprovements = 0;
+                    logger.LogInformation("3 consecutive non-improvements — asking LLM for final push");
+
+                    change = await recommender.GetFinalPushAsync(session, profile, hw, ct);
+                    if (change is null)
+                    {
+                        session.CompletionReason = "LLM confirmed no further improvements possible";
+                        break;
+                    }
+                }
+                else
+                {
+                    change = await recommender.GetNextRecommendationAsync(session, profile, hw, ct);
+                    if (change is null)
+                    {
+                        // Normal pool exhausted — try the final push before giving up
+                        logger.LogInformation("Recommendation pool empty — trying final-push LLM prompt");
+                        change = await recommender.GetFinalPushAsync(session, profile, hw, ct);
+                        if (change is null)
+                        {
+                            session.CompletionReason = "All parameters explored — LLM confirmed nothing further to try";
+                            break;
+                        }
+                        consecutiveNonImprovements = 0;
+                    }
                 }
 
                 var nextSettings = RecommendationService.Apply(session.BestSettings!, change);
                 nextSettings.Label = $"iter{iter}";
 
-                logger.LogInformation(
-                    "Iteration {N}: trying {Param} = {Val} ({Source})",
+                logger.LogInformation("Iteration {N}: {Param} → {Val} [{Source}]",
                     iter, change.Parameter, change.NewValue, change.Source);
 
-                // Restart server with new settings
+                // ── Start server with new settings ────────────────────────────
                 await StopServerAsync();
-                bool started = false;
+                string? startFailReason = null;
+                bool fatalStartFailure = false;
                 try
                 {
                     await StartServerAsync(serverExecutable, modelPath, nextSettings, options.Port, ct);
-                    started = true;
                     consecutiveStartFailures = 0;
                 }
                 catch (Exception ex)
                 {
+                    startFailReason = ex.Message;
                     consecutiveStartFailures++;
                     logger.LogInformation(
-                        "Server rejected {Param}={Val} ({Reason}); reverting to best settings",
+                        "Server failed to start with {Param}={Val} ({Reason})",
                         change.Parameter, change.NewValue, ex.Message);
 
-                    // Revert — if revert also fails, stop cleanly rather than propagate
-                    try
-                    {
-                        await StartServerAsync(serverExecutable, modelPath, session.BestSettings!, options.Port, ct);
-                    }
+                    // Restore best settings so the server stays available for LLM prompts
+                    try { await StartServerAsync(serverExecutable, modelPath, session.BestSettings!, options.Port, ct); }
                     catch (Exception revEx)
                     {
-                        logger.LogInformation("Server could not revert either ({Reason}); stopping optimization", revEx.Message);
-                        session.CompletionReason = "Server failed to restart — optimization stopped early";
-                        break;
+                        logger.LogInformation("Could not restore best settings ({Reason}); stopping", revEx.Message);
+                        session.CompletionReason = "Server failed to restart even on best settings";
+                        fatalStartFailure = true;
+                    }
+
+                    if (!fatalStartFailure && consecutiveStartFailures >= MaxConsecutiveStartFailures)
+                    {
+                        session.CompletionReason = $"Server failed to start {consecutiveStartFailures} times in a row — stopping";
+                        fatalStartFailure = true;
                     }
                 }
 
-                if (!started)
+                // Yield a visible skipped-iteration for start failures (outside the catch)
+                if (startFailReason is not null)
                 {
-                    if (consecutiveStartFailures >= MaxConsecutiveFailures)
+                    string sourceLabel = SourceTag(change.Source);
+                    var skipped = new OptimizationIteration
                     {
-                        session.CompletionReason = $"Server rejected {consecutiveStartFailures} consecutive setting changes — stopping";
-                        break;
-                    }
+                        Number = iter,
+                        Settings = nextSettings,
+                        Result = new BenchmarkResult(),
+                        AppliedChange = change,
+                        StatusMessage = $"[{sourceLabel}] {change.Parameter} → {change.NewValue}  [SKIP — server failed to start]",
+                    };
+                    session.AddIteration(skipped);
+                    yield return skipped;
+                    consecutiveNonImprovements++;
+                    if (fatalStartFailure) break;
                     continue;
                 }
 
+                // ── Benchmark ─────────────────────────────────────────────────
                 BenchmarkResult iterResult;
                 try
                 {
@@ -132,23 +177,30 @@ public class OptimizerService(
                 }
                 catch (Exception ex)
                 {
-                    logger.LogInformation("Benchmark failed ({Reason}); skipping iteration", ex.Message);
+                    logger.LogInformation("Benchmark failed ({Reason}); counting as non-improvement", ex.Message);
+                    consecutiveNonImprovements++;
                     continue;
                 }
 
-                string sourceTag = change.Source == "llm" ? "LLM" : "Heuristic";
+                string tag = SourceTag(change.Source);
                 var iteration = new OptimizationIteration
                 {
                     Number = iter,
                     Settings = nextSettings,
                     Result = iterResult,
                     AppliedChange = change,
-                    StatusMessage = $"[{sourceTag}] {change.Parameter} → {change.NewValue}  \"{change.Reasoning}\"",
+                    StatusMessage = $"[{tag}] {change.Parameter} → {change.NewValue}  \"{change.Reasoning}\"",
                 };
                 session.AddIteration(iteration);
                 await persistence.SaveAsync(session);
 
                 yield return iteration;
+
+                // ── Track non-improvement streak ──────────────────────────────
+                if (iteration.IsBestSoFar)
+                    consecutiveNonImprovements = 0;
+                else
+                    consecutiveNonImprovements++;
             }
         }
         finally
@@ -170,6 +222,13 @@ public class OptimizerService(
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    private static string SourceTag(string source) => source switch
+    {
+        "llm"      => "LLM",
+        "llm-push" => "LLM★",
+        _          => "Heuristic",
+    };
 
     private async Task StartServerAsync(
         string exe, string model, LlamaSettings settings, int port, CancellationToken ct)

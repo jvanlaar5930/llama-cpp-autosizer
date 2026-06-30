@@ -54,6 +54,59 @@ public class RecommendationService(
         return GetHeuristicRecommendation(session, profile, hardware);
     }
 
+    /// <summary>
+    /// "Final push" prompt — used when 3 consecutive iterations haven't improved or when the
+    /// normal pool is exhausted. Asks the LLM for a completely fresh angle; if it responds
+    /// with DONE (or fails to suggest anything) returns null, signalling the loop should end.
+    /// </summary>
+    public async Task<ParameterChange?> GetFinalPushAsync(
+        OptimizationSession session,
+        OptimizationProfile profile,
+        HardwareInfo hardware,
+        CancellationToken ct = default)
+    {
+        if (!server.IsRunning)
+            return GetHeuristicRecommendation(session, profile, hardware);
+
+        try
+        {
+            var prompt = BuildFinalPushPrompt(session, profile, hardware);
+            var (response, _) = await server.CompleteAsync(new CompletionRequest
+            {
+                Prompt = prompt,
+                NPredict = 350,
+                Temperature = 0.5f,
+                Stop = ["\n\n", "```"],
+            }, ct);
+
+            var content = response.Content.Trim();
+
+            // If the LLM responds with "DONE" and no JSON, it's saying nothing more to try
+            bool hasDone = content.Contains("DONE", StringComparison.OrdinalIgnoreCase);
+            bool hasJson = content.Contains('{') && content.Contains('}');
+            if (hasDone && !hasJson) return null;
+
+            var change = ParseLlmResponse(content, session.BestSettings!);
+            if (change is null) return null;
+
+            // Tag it so the UI can show it as a "final push" iteration
+            return new ParameterChange
+            {
+                Parameter = change.Parameter,
+                OldValue = change.OldValue,
+                NewValue = change.NewValue,
+                Reasoning = change.Reasoning,
+                Source = "llm-push",
+            };
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug("Final-push LLM call failed: {Msg}", ex.Message);
+            // Fall back to heuristic so we don't waste an iteration slot
+            return GetHeuristicRecommendation(session, profile, hardware);
+        }
+    }
+
     // -------------------------------------------------------------------------
     // LLM-based recommendation
     // -------------------------------------------------------------------------
@@ -116,27 +169,30 @@ public class RecommendationService(
               $"Reducing active experts saves VRAM and speeds inference at some quality cost."
             : "";
 
+        string moeParam = isMoe
+            ? $"\n- MoeExpertUsed: integer, e.g. 4, 6, 8, 12 (fewer experts = less VRAM + faster; current={bestSettings.MoeExpertUsed?.ToString() ?? "model default"})"
+            : "";
+
         return $$"""
 You are a llama.cpp performance optimizer. Your task is to find the best server settings for this model on this hardware by trying one change at a time.
 Study the results so far and suggest ONE parameter change most likely to improve the composite score.
 You may suggest a different value for a parameter already tried if you think another value will do better.
 
 HARDWARE:
-- GPU VRAM: {{hardware.TotalVramMb}} MB (free: {{hardware.FreeVramMb}} MB)
-- RAM: {{hardware.RamTotalMb}} MB (free: {{hardware.RamFreeMb}} MB)
-- CPU threads: {{hardware.CpuThreads}}
+- GPU: {{(hardware.HasGpu ? $"{hardware.Gpus.FirstOrDefault()?.Name ?? "GPU"} — {hardware.TotalVramMb} MB total, {hardware.FreeVramMb} MB free" : "none (CPU-only)")}}
+- RAM: {{hardware.RamTotalMb}} MB total, {{hardware.RamFreeMb}} MB free
+- CPU: {{hardware.CpuName}} — {{hardware.CpuCores}} cores / {{hardware.CpuThreads}} threads
 
 PROFILE: {{profile.Name}} — {{profile.Description}}{{moeContext}}
 
-BEST SETTINGS SO FAR (score={{best.CompositeScore:F3}}):
+BEST SETTINGS SO FAR (score={{best.CompositeScore:F3}} | TG={{best.GenerationRate:F0}}t/s PP={{best.PromptProcessingRate:F0}}t/s TTFT={{best.TimeToFirstTokenMs:F0}}ms):
 - ctx-size: {{bestSettings.ContextSize}}
 - n-gpu-layers: {{bestSettings.GpuLayers}} (-1 = all layers)
-- batch-size: {{bestSettings.BatchSize}}
-- ubatch-size: {{bestSettings.UBatchSize}}
+- batch-size: {{bestSettings.BatchSize}} / ubatch-size: {{bestSettings.UBatchSize}}
 - flash-attn: {{bestSettings.FlashAttention}}
-- cache-type-k: {{bestSettings.CacheTypeK ?? "f16"}}
-- cache-type-v: {{bestSettings.CacheTypeV ?? "f16"}}
+- cache-type-k: {{bestSettings.CacheTypeK ?? "f16"}} / cache-type-v: {{bestSettings.CacheTypeV ?? "f16"}}
 - threads: {{bestSettings.Threads}} (-1 = auto)
+- mlock: {{bestSettings.Mlock}}
 
 FULL OPTIMIZATION HISTORY:
 {{string.Join("\n", historyLines)}}
@@ -146,17 +202,72 @@ RULE: If a parameter made things worse, try something else OR a different value 
 
 Valid parameters and example values:
 - GpuLayers: -1 (all layers), or a positive integer up to 200
-- ContextSize: power of 2 — 512, 1024, 2048, 4096, 8192, 16384, 32768
+- ContextSize: power of 2 — 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536
 - BatchSize: 64, 128, 256, 512, 1024, 2048
-- UBatchSize: 64, 128, 256, 512, 1024
+- UBatchSize: 32, 64, 128, 256, 512, 1024
 - FlashAttention: true or false
 - CacheTypeK: "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"
 - CacheTypeV: "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"
 - Threads: -1 (auto), or 1–{{hardware.CpuThreads}}
-- Mlock: true or false
+- Mlock: true or false{{moeParam}}
 
 Respond with ONLY this JSON (no markdown, no extra text before or after):
 {"parameter":"<name>","value":<value>,"reasoning":"<one sentence explaining why this should help>"}
+""";
+    }
+
+    private static string BuildFinalPushPrompt(
+        OptimizationSession session, OptimizationProfile profile, HardwareInfo hardware)
+    {
+        var best = session.BestResult!;
+        var bestSettings = session.Best!.Settings;
+        double baselineScore = session.Iterations[0].Result.CompositeScore;
+        bool isMoe = LlamaSettings.IsMoeModel(session.ModelPath);
+
+        var triedSummary = session.Iterations
+            .Where(i => i.AppliedChange is not null)
+            .Select(i => $"  {i.AppliedChange!.Parameter}={i.AppliedChange.NewValue} → score={i.Result.CompositeScore:F3} ({(i.IsBestSoFar ? "★ best" : i.Result.CompositeScore >= baselineScore ? "ok" : "worse")})")
+            .ToList();
+
+        string moeParam = isMoe
+            ? $"\n- MoeExpertUsed: integer (e.g. 4, 6, 8, 12) — fewer experts saves VRAM and increases speed"
+            : "";
+
+        return $$"""
+You are a llama.cpp performance optimizer. After {{triedSummary.Count}} attempts, the last 3 iterations produced no improvement.
+
+HARDWARE:
+- GPU: {{(hardware.HasGpu ? $"{hardware.Gpus.FirstOrDefault()?.Name ?? "GPU"} — {hardware.TotalVramMb} MB total, {hardware.FreeVramMb} MB free" : "none (CPU-only)")}}
+- RAM: {{hardware.RamTotalMb}} MB total, {{hardware.RamFreeMb}} MB free
+- CPU: {{hardware.CpuName}} — {{hardware.CpuCores}} cores / {{hardware.CpuThreads}} threads
+
+PROFILE: {{profile.Name}} — {{profile.Description}}
+
+BEST SETTINGS (score={{best.CompositeScore:F3}} vs baseline={{baselineScore:F3}} | TG={{best.GenerationRate:F0}}t/s PP={{best.PromptProcessingRate:F0}}t/s TTFT={{best.TimeToFirstTokenMs:F0}}ms):
+- ctx-size: {{bestSettings.ContextSize}}
+- n-gpu-layers: {{bestSettings.GpuLayers}} (-1 = all layers)
+- batch-size: {{bestSettings.BatchSize}} / ubatch-size: {{bestSettings.UBatchSize}}
+- flash-attn: {{bestSettings.FlashAttention}}
+- cache-type-k: {{bestSettings.CacheTypeK ?? "f16"}} / cache-type-v: {{bestSettings.CacheTypeV ?? "f16"}}
+- threads: {{bestSettings.Threads}} / mlock: {{bestSettings.Mlock}}
+
+ALREADY TRIED:
+{{string.Join("\n", triedSummary)}}
+
+We need a fresh approach. Think carefully about:
+- Whether a completely different GPU layer count might hit a sweet spot
+- Context sizes not yet tried (both smaller for speed, larger if VRAM permits)
+- Combinations we haven't explored (e.g. flash-attn + smaller ubatch)
+- KV cache quantization levels not yet tried
+- Thread count tuning for CPU-bound operations
+- Mlock if the model fits in RAM
+- Ubatch vs batch ratios{{moeParam}}
+
+If you genuinely believe no further optimization is possible given what has been tried and the hardware constraints, respond with exactly:
+DONE
+
+Otherwise respond with ONLY this JSON (no markdown, no extra text):
+{"parameter":"<name>","value":<value>,"reasoning":"<specific reason this new angle is worth trying>"}
 """;
     }
 
