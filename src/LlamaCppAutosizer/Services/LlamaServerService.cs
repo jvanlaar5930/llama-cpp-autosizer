@@ -121,6 +121,10 @@ public class LlamaServerService(
     private const int LogBufferMax = 150;
     // Sticky flag: once mmap fails on this machine/session, skip it on all future starts
     private bool _mmapFailed;
+    // Sticky flag: once quantized K/V cache fails to start, skip it on all future starts
+    // (e.g. some llama.cpp builds reject non-f16 cache types without --flash-attn, or for
+    // certain head dims regardless of flash-attn).
+    private bool _kvCacheQuantFailed;
     private readonly JsonSerializerOptions _jsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -131,8 +135,18 @@ public class LlamaServerService(
     public string BaseUrl => $"http://127.0.0.1:{_port}";
     public int? ServerProcessId => _serverProcess is { HasExited: false } ? _serverProcess.Id : null;
 
+    /// <summary>
+    /// The settings actually used to launch the currently-running (or last-launched) server.
+    /// Differs from what was requested when an auto-revert (mmap / KV cache quant) kicked in.
+    /// </summary>
+    public LlamaSettings? LastEffectiveSettings { get; private set; }
+
+    /// <summary>Human-readable note describing any auto-revert applied on the last start, or null.</summary>
+    public string? LastStartAdjustmentNote { get; private set; }
+
     /// <summary>Starts llama-server with the given settings. Waits until the health endpoint responds.
-    /// Automatically retries with --no-mmap if a memory-mapping failure is detected.</summary>
+    /// Automatically retries with --no-mmap if a memory-mapping failure is detected, and likewise
+    /// reverts quantized K/V cache types to f16 if the server rejects that combination.</summary>
     public async Task StartAsync(
         string serverExecutable,
         string modelPath,
@@ -144,11 +158,17 @@ public class LlamaServerService(
 
         _port = port;
         while (_logBuffer.TryDequeue(out string? _)) { }
+        LastStartAdjustmentNote = null;
 
         var resolvedExe = ResolveExecutable(serverExecutable);
 
-        // If mmap already failed this session, skip it rather than waste a retry cycle
-        var effectiveSettings = (_mmapFailed && settings.Mmap) ? WithNoMmap(settings) : settings;
+        // If mmap or quantized KV cache already failed this session, skip them rather than
+        // waste a retry cycle.
+        var effectiveSettings = settings;
+        if (_mmapFailed && effectiveSettings.Mmap)
+            effectiveSettings = WithNoMmap(effectiveSettings);
+        if (_kvCacheQuantFailed && HasQuantizedKvCache(effectiveSettings))
+            effectiveSettings = WithoutQuantizedKvCache(effectiveSettings);
 
         LaunchProcess(resolvedExe, effectiveSettings, modelPath, port);
 
@@ -160,15 +180,35 @@ public class LlamaServerService(
         {
             // mmap failed — kill the crashed process, then retry without it
             _mmapFailed = true;
+            LastStartAdjustmentNote = "mmap disabled (memory-mapping failed)";
             _logHandler?.Invoke(
                 "[autosizer] Memory-mapping failed (GGML_ASSERT mmap) — retrying with --no-mmap");
 
             await KillProcessAsync();
             while (_logBuffer.TryDequeue(out string? _)) { }
 
-            LaunchProcess(resolvedExe, WithNoMmap(settings), modelPath, port);
+            effectiveSettings = WithNoMmap(effectiveSettings);
+            LaunchProcess(resolvedExe, effectiveSettings, modelPath, port);
             await WaitForHealthAsync(ct);   // if this also fails, let it throw normally
         }
+        catch (InvalidOperationException ex) when (
+            !_kvCacheQuantFailed && HasQuantizedKvCache(effectiveSettings) && IsCacheTypeFailure(ex.Message))
+        {
+            // Quantized K/V cache failed — kill the crashed process, then retry with f16 K/V.
+            _kvCacheQuantFailed = true;
+            LastStartAdjustmentNote = "quantized K/V cache reverted to f16 (rejected by server)";
+            _logHandler?.Invoke(
+                "[autosizer] Quantized K/V cache failed to start — retrying with f16 K/V cache");
+
+            await KillProcessAsync();
+            while (_logBuffer.TryDequeue(out string? _)) { }
+
+            effectiveSettings = WithoutQuantizedKvCache(effectiveSettings);
+            LaunchProcess(resolvedExe, effectiveSettings, modelPath, port);
+            await WaitForHealthAsync(ct);   // if this also fails, let it throw normally
+        }
+
+        LastEffectiveSettings = effectiveSettings;
     }
 
     // Spawns the process and wires up stderr capture. Does not wait for health.
@@ -225,6 +265,30 @@ public class LlamaServerService(
         c.Mmap = false;
         return c;
     }
+
+    private static bool HasQuantizedKvCache(LlamaSettings s) =>
+        (s.CacheTypeK is not null and not "f16") || (s.CacheTypeV is not null and not "f16");
+
+    private static LlamaSettings WithoutQuantizedKvCache(LlamaSettings s)
+    {
+        var c = s.Clone();
+        c.CacheTypeK = null;
+        c.CacheTypeV = null;
+        return c;
+    }
+
+    // Best-effort match against the various ways llama.cpp builds report a rejected
+    // K/V cache type — exact wording varies by version (e.g. requiring --flash-attn for
+    // non-f16 cache, or a head-dim/block-size assertion).
+    private static bool IsCacheTypeFailure(string message) =>
+        message.Contains("type_k", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("type_v", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("cache_type", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("V cache", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("K cache", StringComparison.OrdinalIgnoreCase) ||
+        (message.Contains("flash_attn", StringComparison.OrdinalIgnoreCase) &&
+         (message.Contains("quant", StringComparison.OrdinalIgnoreCase) ||
+          message.Contains("GGML_ASSERT", StringComparison.OrdinalIgnoreCase)));
 
     // Resolve a user-supplied path that may be a directory or lack an extension.
     // Mirrors TurboQuantService.ResolveWindowsExecutable — kept local to avoid coupling.

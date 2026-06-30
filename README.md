@@ -29,7 +29,9 @@ It spawns `llama-server`, runs a battery of timed prompts, collects real metrics
 - **Named profiles** — save optimized settings under a name, launch `llama-server` with one keypress, and reuse across sessions
 - **Manual overrides** — full interactive settings editor lets you pin any value or inject raw CLI args as hints before or during optimization
 - **TurboQuant integration** — set `turbo4`/`turbo3` KV cache types and quantize models via [llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant)
-- **Live progress display** — iteration table updates in real time showing PP speed, TG speed, TTFT, score, and whether a recommendation came from the model or heuristics
+- **Live progress display** — status line and progress bar update in real time during optimization, showing PP speed, TG speed, TTFT, score, and whether a recommendation came from the model or heuristics; `llama-server`'s own log streams above it as normal scrolling console output, so you can scroll back through full startup/request history
+- **Live profile monitoring** — running a named profile shows real-time CPU/RAM/GPU usage and live generation speed (t/s); press `L` to flip between the settings summary and a full-screen scrolling log view
+- **Self-healing server starts** — automatically retries with `--no-mmap` or f16 K/V cache if the requested setting fails to start (e.g. quantized KV cache unsupported without flash attention), so a single incompatible setting doesn't stall the whole optimization run
 - **Historical comparison** — loads all past sessions and renders a ranked side-by-side table across every model and run; exportable as CSV or JSON
 - **Session persistence** — every run is saved to `sessions/` as JSON; reload any past session to view results or apply its best settings
 - **Ready-to-use output** — final result includes the exact `llama-server` command to paste into a terminal or script
@@ -122,7 +124,7 @@ Optimizes for agent loops and tool-calling workloads — high prompt-processing 
 
 After an optimization run (or after editing settings manually) you can save the configuration under a name. From menu option 7 you can:
 
-- **Run** a saved profile — starts `llama-server` with that configuration and shows the endpoint URL (`http://127.0.0.1:8080/v1`), expected TG/PP speeds, and key settings. The server stays up until you press any key.
+- **Run** a saved profile — starts `llama-server` with that configuration and shows the endpoint URL (`http://127.0.0.1:8080/v1`), expected TG/PP speeds, key settings, and live CPU/RAM/GPU/generation-speed stats. Press `L` to switch to a full-screen scrolling log view, or any other key to stop the server.
 - **Edit** settings on a saved profile
 - **Rename** or add notes
 - **Delete** profiles that are no longer needed
@@ -135,11 +137,11 @@ After an optimization run (or after editing settings manually) you can save the 
 2. **Initial estimate** — derives starting values for GPU layers, context size, and thread count from hardware and model file size
 3. **Baseline benchmark** — runs warmup prompts then timed completions, recording PP speed, TG speed, and TTFT from `llama-server`'s `/completion` response timings
 4. **Recommendation** — sends the benchmark history and current settings to the running model and asks it to suggest one parameter change (JSON response); falls back to heuristic rules if the model doesn't cooperate
-5. **Apply and re-benchmark** — restarts `llama-server` with the new setting, re-runs the benchmark suite, scores the result
+5. **Apply and re-benchmark** — restarts `llama-server` with the new setting, re-runs the benchmark suite, scores the result. If the setting fails to start (e.g. quantized KV cache rejected without flash attention, or an mmap failure), the server automatically retries once with that setting reverted so the run keeps going instead of stalling
 6. **Iterate** — repeats until the score improvement drops below a threshold for N consecutive rounds, or the iteration cap is reached
 7. **Output** — prints the best settings and the exact `llama-server` command to use
 
-Parameters explored (in typical order): GPU layers → flash attention → KV cache quantization (`q8_0`, `q4_0`, `turbo4`, `turbo3`) → batch size → context size → thread count → mlock.
+Parameters explored (in typical order): GPU layers → MoE active-expert count (MoE models only) → flash attention → KV cache quantization (`q8_0`, `q4_0`, `turbo4`, `turbo3`) → batch size → context size → thread count → mlock.
 
 ---
 

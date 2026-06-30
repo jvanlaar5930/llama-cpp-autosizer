@@ -1,7 +1,6 @@
 using LlamaCppAutosizer.Models;
 using LlamaCppAutosizer.Services;
 using Spectre.Console;
-using Spectre.Console.Rendering;
 
 namespace LlamaCppAutosizer.UI;
 
@@ -26,6 +25,7 @@ public class MainMenu(
     private HardwareInfo? _hardware;
 
     private const string ConfigFile = "autosizer-config.json";
+    private static readonly string[] SpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
     // -------------------------------------------------------------------------
     // Entry point
@@ -383,7 +383,10 @@ public class MainMenu(
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
-        // Capture llama-server stdout into a rolling log shown below the header.
+        // Server log lines are printed as normal scrolling console output (so the user can
+        // scroll the terminal back through full history) with a small fixed-height footer
+        // (status/spinner + progress bar) redrawn in place below them via relative ANSI
+        // cursor movement — the same technique MenuHelper uses for its own redraws.
         var logQueue = new System.Collections.Concurrent.ConcurrentQueue<string>();
         llamaServer.SetLogHandler(logQueue.Enqueue);
 
@@ -391,43 +394,83 @@ public class MainMenu(
         var iterations = optimizer.OptimizeAsync(
             _serverExecutable, _modelPath, initialSettings, _profile, session, opts, cts.Token);
 
-        var logLines = new Queue<string>();
-        const int MaxLogLines = 10;
-        string iterStatus = "Starting…";
-        string iterSub = "";
+        AnsiConsole.Write(new Rule("[grey dim]llama-server log (scroll up for history)[/]").RuleStyle("grey dim"));
+
+        int footerLineCount = 0;
+        int spinnerFrame = 0;
         int iterDone = 0;
 
-        await AnsiConsole.Live(BuildOptimizationPanel(logLines, iterStatus, iterSub, iterDone, maxIter))
-            .AutoClear(false)
-            .Overflow(VerticalOverflow.Crop)
-            .StartAsync(async ctx =>
+        void DrainLogs()
+        {
+            while (logQueue.TryDequeue(out var line))
             {
-                await foreach (var iter in iterations.WithCancellation(cts.Token))
+                if (!string.IsNullOrWhiteSpace(line))
+                    AnsiConsole.MarkupLine($"[grey]{Markup.Escape(line)}[/]");
+            }
+        }
+
+        void RedrawFooter(IReadOnlyList<string> lines)
+        {
+            if (footerLineCount > 0)
+                Console.Write($"\x1b[{footerLineCount}A\r\x1b[0J");
+            DrainLogs();
+            foreach (var line in lines)
+                AnsiConsole.MarkupLine(line);
+            footerLineCount = lines.Count;
+        }
+
+        string BuildProgressLine()
+        {
+            double pct = maxIter > 0 ? (double)iterDone / (maxIter + 1) * 100.0 : 0;
+            int barWidth = 30;
+            int filled = (int)(barWidth * pct / 100.0);
+            string bar = $"[cyan]{new string('█', filled)}[/]{new string('░', barWidth - filled)}";
+            return $"{bar}  {pct:F0}%  ({iterDone}/{maxIter + 1})";
+        }
+
+        await using (var enumerator = iterations.GetAsyncEnumerator(cts.Token))
+        {
+            var moveNextTask = enumerator.MoveNextAsync().AsTask();
+
+            while (true)
+            {
+                // While waiting for the next iteration (server start + benchmark can take a
+                // while, especially the first/baseline one), keep the footer alive: spin,
+                // and flush any server log lines as they scroll in.
+                while (!moveNextTask.IsCompleted)
                 {
-                    // Drain any new log lines from the server into the rolling buffer.
-                    while (logQueue.TryDequeue(out var line))
-                    {
-                        if (!string.IsNullOrWhiteSpace(line))
-                        {
-                            logLines.Enqueue(line);
-                            while (logLines.Count > MaxLogLines) logLines.Dequeue();
-                        }
-                    }
-
-                    iterDone++;
-                    string bestMark = iter.IsBestSoFar ? "  [bold green]★ best[/]" : "";
-                    iterStatus = $"[grey]iter {iter.Number}/{maxIter}[/]  " +
-                                 $"score=[green]{iter.Result.CompositeScore:F3}[/]  " +
-                                 $"TG=[cyan]{iter.Result.GenerationRate:F1}t/s[/]  " +
-                                 $"PP=[cyan]{iter.Result.PromptProcessingRate:F0}t/s[/]" +
-                                 bestMark;
-                    iterSub = iter.StatusMessage is not null
-                        ? Markup.Escape(iter.StatusMessage)
-                        : "";
-
-                    ctx.UpdateTarget(BuildOptimizationPanel(logLines, iterStatus, iterSub, iterDone, maxIter));
+                    string waitingLabel = iterDone == 0 ? "Preparing llama-server…" : "Working…";
+                    RedrawFooter([
+                        $"[yellow]{SpinnerFrames[spinnerFrame++ % SpinnerFrames.Length]} {waitingLabel}[/]",
+                        BuildProgressLine(),
+                    ]);
+                    await Task.WhenAny(moveNextTask, Task.Delay(150, cts.Token));
                 }
-            });
+
+                if (!await moveNextTask) break;
+                var iter = enumerator.Current;
+
+                iterDone++;
+                string bestMark = iter.IsBestSoFar ? "  [bold green]★ best[/]" : "";
+                string iterStatus = $"[grey]iter {iter.Number}/{maxIter}[/]  " +
+                             $"score=[green]{iter.Result.CompositeScore:F3}[/]  " +
+                             $"TG=[cyan]{iter.Result.GenerationRate:F1}t/s[/]  " +
+                             $"PP=[cyan]{iter.Result.PromptProcessingRate:F0}t/s[/]" +
+                             bestMark;
+                string iterSub = iter.StatusMessage is not null
+                    ? Markup.Escape(iter.StatusMessage)
+                    : "";
+
+                var footerLines = new List<string> { iterStatus };
+                if (!string.IsNullOrEmpty(iterSub)) footerLines.Add($"  [grey]{iterSub}[/]");
+                footerLines.Add(BuildProgressLine());
+                RedrawFooter(footerLines);
+
+                moveNextTask = enumerator.MoveNextAsync().AsTask();
+            }
+        }
+
+        DrainLogs();
 
         llamaServer.SetLogHandler(null);
 
@@ -802,50 +845,6 @@ public class MainMenu(
 
         AnsiConsole.WriteLine("Press any key...");
         Console.ReadKey(intercept: true);
-    }
-
-    // -------------------------------------------------------------------------
-    // Optimization live panel
-    // -------------------------------------------------------------------------
-
-    private static IRenderable BuildOptimizationPanel(
-        Queue<string> logLines,
-        string iterStatus,
-        string iterSub,
-        int iterDone,
-        int maxIter)
-    {
-        var parts = new List<IRenderable>();
-
-        // Scrolling server log
-        if (logLines.Count > 0)
-        {
-            var logRows = new List<IRenderable>();
-            foreach (var line in logLines)
-                logRows.Add(new Text(line, new Style(Color.Grey)));
-
-            parts.Add(new Panel(new Rows(logRows))
-            {
-                Header = new PanelHeader("[grey dim]llama-server log[/]"),
-                Border = BoxBorder.Rounded,
-                BorderStyle = new Style(Color.Grey),
-                Padding = new Padding(1, 0),
-            });
-        }
-
-        // Progress line
-        double pct = maxIter > 0 ? (double)iterDone / (maxIter + 1) * 100.0 : 0;
-        int barWidth = 30;
-        int filled = (int)(barWidth * pct / 100.0);
-        string bar = $"[cyan]{new string('█', filled)}[/]{new string('░', barWidth - filled)}";
-        string progress = $"{bar}  {pct:F0}%  ({iterDone}/{maxIter + 1})";
-
-        parts.Add(new Markup(iterStatus));
-        if (!string.IsNullOrEmpty(iterSub))
-            parts.Add(new Markup($"  [grey]{iterSub}[/]"));
-        parts.Add(new Markup(progress));
-
-        return new Rows(parts);
     }
 
     // -------------------------------------------------------------------------

@@ -398,6 +398,7 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
         var bestSettings = session.BestSettings!;
         double baselineScore = session.Iterations[0].Result.CompositeScore;
         bool scoreImproved = best.CompositeScore > baselineScore;
+        bool isMoe = LlamaSettings.IsMoeModel(session.ModelPath);
 
         // If VRAM is available and GPU layers aren't already maxed (-1 = all), try more
         if (!tried.Contains("GpuLayers") && hardware.HasGpu && bestSettings.GpuLayers != -1)
@@ -406,6 +407,20 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
             if (suggestedNgl > bestSettings.GpuLayers)
                 return Change("GpuLayers", bestSettings.GpuLayers, suggestedNgl,
                     "More GPU layers offloads computation to VRAM, improving TG speed");
+        }
+
+        // MoE models: reducing active experts per token frees VRAM and cuts compute.
+        // Try this early — it's one of the highest-impact levers for MoE architectures
+        // and the heuristic path is the only one guaranteed to explore it if the LLM
+        // recommender isn't producing usable suggestions.
+        if (isMoe && !tried.Contains("MoeExpertUsed"))
+        {
+            int suggestedExperts = bestSettings.MoeExpertUsed.HasValue
+                ? Math.Max(1, bestSettings.MoeExpertUsed.Value - 2)
+                : 4;
+            if (suggestedExperts != (bestSettings.MoeExpertUsed ?? -1))
+                return Change("MoeExpertUsed", bestSettings.MoeExpertUsed?.ToString() ?? "model default", suggestedExperts,
+                    "Fewer active experts per token reduces compute and VRAM with some quality tradeoff");
         }
 
         // Try flash attention if not enabled
@@ -421,6 +436,18 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
         if (!tried.Contains("CacheTypeV") && bestSettings.CacheTypeV is null or "f16")
             return Change("CacheTypeV", bestSettings.CacheTypeV ?? "f16", "q8_0",
                 "q8_0 KV cache halves KV cache VRAM with minimal quality loss");
+
+        // MoE: escalate to fewer experts still if the first reduction helped
+        if (isMoe && tried.Contains("MoeExpertUsed") && bestSettings.MoeExpertUsed is > 2)
+        {
+            int nextExperts = Math.Max(1, bestSettings.MoeExpertUsed.Value - 2);
+            bool alreadyTried = session.Iterations.Any(i =>
+                i.AppliedChange?.Parameter == "MoeExpertUsed" &&
+                Convert.ToInt32(i.AppliedChange.NewValue) == nextExperts);
+            if (!alreadyTried)
+                return Change("MoeExpertUsed", bestSettings.MoeExpertUsed.Value, nextExperts,
+                    "Reducing active experts further — the first reduction improved the score");
+        }
 
         // Tune batch size based on profile
         if (!tried.Contains("BatchSize"))

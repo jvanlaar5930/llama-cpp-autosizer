@@ -45,19 +45,25 @@ public class OptimizerService(
             // ── Iteration 0: baseline ─────────────────────────────────────────
             logger.LogInformation("Starting baseline benchmark");
             await StartServerAsync(serverExecutable, modelPath, initialSettings, options.Port, ct);
+            // Server may have auto-reverted an unsupported setting (e.g. mmap, quantized KV
+            // cache) to get started — use what's actually running, not what was requested.
+            var effectiveInitialSettings = server.LastEffectiveSettings ?? initialSettings;
+            string? initialAdjustment = server.LastStartAdjustmentNote;
 
-            var baselineResult = await benchmarks.RunAsync(initialSettings, modelPath, profile, ct);
+            var baselineResult = await benchmarks.RunAsync(effectiveInitialSettings, modelPath, profile, ct);
             baselineResult.CompositeScore = profile.ScoreResult(baselineResult);
             baselineResult.Notes = "Baseline";
 
             var baseline = new OptimizationIteration
             {
                 Number = 0,
-                Settings = initialSettings.Clone(),
+                Settings = effectiveInitialSettings.Clone(),
                 Result = baselineResult,
                 AppliedChange = null,
                 IsBestSoFar = true,
-                StatusMessage = "Baseline — establishing reference score",
+                StatusMessage = initialAdjustment is null
+                    ? "Baseline — establishing reference score"
+                    : $"Baseline — establishing reference score (auto-adjusted: {initialAdjustment})",
             };
             session.AddIteration(baseline);
             await persistence.SaveAsync(session);
@@ -119,11 +125,16 @@ public class OptimizerService(
                 // ── Start server with new settings ────────────────────────────
                 await StopServerAsync();
                 string? startFailReason = null;
+                string? startAdjustment = null;
                 bool fatalStartFailure = false;
                 try
                 {
                     await StartServerAsync(serverExecutable, modelPath, nextSettings, options.Port, ct);
                     consecutiveStartFailures = 0;
+                    // Server may have auto-reverted an unsupported setting (e.g. quantized KV
+                    // cache rejected without flash-attn) to get started — record what actually ran.
+                    nextSettings = server.LastEffectiveSettings ?? nextSettings;
+                    startAdjustment = server.LastStartAdjustmentNote;
                 }
                 catch (Exception ex)
                 {
@@ -183,13 +194,14 @@ public class OptimizerService(
                 }
 
                 string tag = SourceTag(change.Source);
+                string adjustmentSuffix = startAdjustment is null ? "" : $"  (auto-adjusted: {startAdjustment})";
                 var iteration = new OptimizationIteration
                 {
                     Number = iter,
                     Settings = nextSettings,
                     Result = iterResult,
                     AppliedChange = change,
-                    StatusMessage = $"[{tag}] {change.Parameter} → {change.NewValue}  \"{change.Reasoning}\"",
+                    StatusMessage = $"[{tag}] {change.Parameter} → {change.NewValue}  \"{change.Reasoning}\"{adjustmentSuffix}",
                 };
                 session.AddIteration(iteration);
                 await persistence.SaveAsync(session);
