@@ -359,6 +359,16 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
                     bool ml = value.GetBoolean();
                     return (settings.Mlock, ml != settings.Mlock ? ml : (object?)null);
 
+                case "MoeExpertUsed":
+                    // 1–256; 0 means "model default" (treated as null = don't pass the arg)
+                    int experts = Math.Clamp(value.GetInt32(), 0, 256);
+                    int? newExperts = experts == 0 ? null : experts;
+                    return (settings.MoeExpertUsed, newExperts != settings.MoeExpertUsed ? newExperts : (object?)null);
+
+                case "ThinkingEnabled":
+                    bool thinking = value.GetBoolean();
+                    return (settings.ThinkingEnabled, thinking != settings.ThinkingEnabled ? thinking : (object?)null);
+
                 default:
                     return (null, null);
             }
@@ -487,6 +497,8 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
             case "CacheTypeV":      s.CacheTypeV = change.NewValue?.ToString(); break;
             case "Threads":         s.Threads = Convert.ToInt32(change.NewValue); break;
             case "Mlock":           s.Mlock = Convert.ToBoolean(change.NewValue); break;
+            case "MoeExpertUsed":   s.MoeExpertUsed = change.NewValue is null ? null : Convert.ToInt32(change.NewValue); break;
+            case "ThinkingEnabled": s.ThinkingEnabled = change.NewValue is null ? null : Convert.ToBoolean(change.NewValue); break;
         }
         return s;
     }

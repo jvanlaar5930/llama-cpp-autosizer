@@ -65,7 +65,9 @@ public class LlamaSettings
 
         if (Threads >= 0) { args.Add("--threads"); args.Add(Threads.ToString()); }
         if (ThreadsBatch >= 0) { args.Add("--threads-batch"); args.Add(ThreadsBatch.ToString()); }
-        if (FlashAttention) args.Add("--flash-attn");
+        // Pass an explicit value so llama-server doesn't misinterpret the next arg
+        // as the value for --flash-attn (it now accepts [on|off|auto]).
+        if (FlashAttention) { args.Add("--flash-attn"); args.Add("on"); }
         if (!Mmap) args.Add("--no-mmap");
         if (Mlock) args.Add("--mlock");
         if (CacheTypeK is not null) { args.Add("--cache-type-k"); args.Add(CacheTypeK); }
