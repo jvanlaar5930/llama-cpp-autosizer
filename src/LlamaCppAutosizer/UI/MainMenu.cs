@@ -1,12 +1,14 @@
 using LlamaCppAutosizer.Models;
 using LlamaCppAutosizer.Services;
 using Spectre.Console;
+using Spectre.Console.Rendering;
 
 namespace LlamaCppAutosizer.UI;
 
 public class MainMenu(
     HardwareDetectionService hwService,
     OptimizerService optimizer,
+    LlamaServerService llamaServer,
     TurboQuantService turboQuant,
     SessionPersistenceService persistence,
     ProfileLibraryService profileLibrary,
@@ -284,16 +286,74 @@ public class MainMenu(
         BenchmarkDisplay.RenderHardwareInfo(_hardware);
         AnsiConsole.WriteLine();
 
-        // Build initial settings from hardware detection
-        var initialSettings = OptimizerService.BuildInitialSettings(_modelPath, _profile, _hardware);
+        // ── Starting settings: auto-detect or load an existing profile ──────────
+        LlamaSettings initialSettings;
+        var savedProfiles = await profileLibrary.ListProfilesAsync();
+
+        // Show profiles for the current model first; fall back to all if none match.
+        var relevantProfiles = savedProfiles
+            .Where(p => string.Equals(p.ModelPath, _modelPath, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        var choicePool = relevantProfiles.Count > 0 ? relevantProfiles : savedProfiles;
+
+        if (choicePool.Count > 0 &&
+            AnsiConsole.Confirm("Start from an existing named profile?", false))
+        {
+            var profileChoices = choicePool
+                .Select(p =>
+                {
+                    string score = p.BenchmarkScore.HasValue ? $"  score={p.BenchmarkScore:F3}" : "";
+                    string tg    = p.BenchmarkTgRate.HasValue ? $"  TG={p.BenchmarkTgRate:F0}t/s" : "";
+                    string model = !string.Equals(p.ModelPath, _modelPath, StringComparison.OrdinalIgnoreCase)
+                        ? $"  [grey]({Markup.Escape(p.ModelName)})[/]" : "";
+                    return $"[cyan]{Markup.Escape(p.Name)}[/]{score}{tg}{model}";
+                })
+                .Prepend("[grey]── Auto-detect from hardware ──[/]")
+                .ToList();
+
+            string? picked = MenuHelper.Select("Select starting profile:", profileChoices);
+
+            if (picked is null || picked.StartsWith("[grey]──"))
+            {
+                initialSettings = OptimizerService.BuildInitialSettings(_modelPath, _profile, _hardware);
+            }
+            else
+            {
+                int idx = profileChoices.IndexOf(picked) - 1; // -1 because of the prepended header
+                var sourceProfile = choicePool[idx];
+                initialSettings = sourceProfile.Settings.Clone();
+                AnsiConsole.MarkupLine($"[grey]Starting from profile:[/] [cyan]{Markup.Escape(sourceProfile.Name)}[/]");
+                AnsiConsole.WriteLine();
+            }
+        }
+        else
+        {
+            initialSettings = OptimizerService.BuildInitialSettings(_modelPath, _profile, _hardware);
+        }
 
         // Show and allow override
-        AnsiConsole.Write(new Rule("[bold]Initial Settings (estimated)[/]").RuleStyle("yellow"));
+        AnsiConsole.Write(new Rule("[bold]Initial Settings[/]").RuleStyle("yellow"));
         SettingsEditor.RenderSettings(initialSettings, LlamaSettings.IsMoeModel(_modelPath));
         AnsiConsole.WriteLine();
 
         if (AnsiConsole.Confirm("Override any settings before starting?", false))
             initialSettings = SettingsEditor.Edit(initialSettings, "Starting Settings", _modelPath);
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(new Panel(
+            "[yellow]WARNING:[/] Optimization runs the model at full load repeatedly.\n" +
+            "Your system [bold]may become slow or temporarily unresponsive[/] during this process,\n" +
+            "especially with large models or limited VRAM. Save any open work before proceeding.\n" +
+            "Press [bold]Ctrl+C[/] at any time to stop early and keep the best result found so far.")
+        {
+            Border = BoxBorder.Rounded,
+            BorderStyle = new Style(Color.Yellow),
+            Padding = new Padding(1, 0),
+        });
+        AnsiConsole.WriteLine();
+
+        if (!AnsiConsole.Confirm("Proceed with optimization?", true))
+            return;
 
         AnsiConsole.WriteLine();
         int maxIter = AnsiConsole.Prompt(
@@ -317,46 +377,59 @@ public class MainMenu(
         AnsiConsole.Clear();
         AnsiConsole.Write(new Rule("[bold cyan]Running Optimization[/]").RuleStyle("cyan"));
         AnsiConsole.MarkupLine($"[grey]Model: {Markup.Escape(session.ModelName)}  Profile: {Markup.Escape(_profile.Name)}  Max iterations: {maxIter}[/]");
+        AnsiConsole.MarkupLine("[yellow]⚠ System may become slow or unresponsive during benchmarking — this is normal.[/]");
         AnsiConsole.MarkupLine("[grey]Press Ctrl+C to stop early and keep the best result found so far.[/]");
         AnsiConsole.WriteLine();
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
+        // Capture llama-server stdout into a rolling log shown below the header.
+        var logQueue = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        llamaServer.SetLogHandler(logQueue.Enqueue);
+
         // Optimizer writes iterations into session directly; we only read them here for the UI.
         var iterations = optimizer.OptimizeAsync(
             _serverExecutable, _modelPath, initialSettings, _profile, session, opts, cts.Token);
 
-        await AnsiConsole.Progress()
+        var logLines = new Queue<string>();
+        const int MaxLogLines = 10;
+        string iterStatus = "Starting…";
+        string iterSub = "";
+        int iterDone = 0;
+
+        await AnsiConsole.Live(BuildOptimizationPanel(logLines, iterStatus, iterSub, iterDone, maxIter))
             .AutoClear(false)
-            .Columns(new ProgressColumn[]
-            {
-                new TaskDescriptionColumn(),
-                new ProgressBarColumn(),
-                new PercentageColumn(),
-                new SpinnerColumn(),
-            })
+            .Overflow(VerticalOverflow.Crop)
             .StartAsync(async ctx =>
             {
-                // +1 for the baseline (iter 0) which is also yielded
-                var task = ctx.AddTask($"[cyan]Optimizing {session.ModelName}[/]", maxValue: maxIter + 1);
-
                 await foreach (var iter in iterations.WithCancellation(cts.Token))
                 {
-                    task.Increment(1);
+                    // Drain any new log lines from the server into the rolling buffer.
+                    while (logQueue.TryDequeue(out var line))
+                    {
+                        if (!string.IsNullOrWhiteSpace(line))
+                        {
+                            logLines.Enqueue(line);
+                            while (logLines.Count > MaxLogLines) logLines.Dequeue();
+                        }
+                    }
 
-                    string bestMark = iter.IsBestSoFar ? " [bold green]★ best[/]" : "";
-                    string scoreStr = $"score=[green]{iter.Result.CompositeScore:F3}[/] TG=[cyan]{iter.Result.GenerationRate:F1}t/s[/] PP=[cyan]{iter.Result.PromptProcessingRate:F0}t/s[/]";
-
-                    // Escape any Spectre markup chars that may appear in LLM reasoning
-                    string statusLine = iter.StatusMessage is not null
+                    iterDone++;
+                    string bestMark = iter.IsBestSoFar ? "  [bold green]★ best[/]" : "";
+                    iterStatus = $"[grey]iter {iter.Number}/{maxIter}[/]  " +
+                                 $"score=[green]{iter.Result.CompositeScore:F3}[/]  " +
+                                 $"TG=[cyan]{iter.Result.GenerationRate:F1}t/s[/]  " +
+                                 $"PP=[cyan]{iter.Result.PromptProcessingRate:F0}t/s[/]" +
+                                 bestMark;
+                    iterSub = iter.StatusMessage is not null
                         ? Markup.Escape(iter.StatusMessage)
                         : "";
 
-                    task.Description =
-                        $"[grey]iter {iter.Number}/{maxIter}[/]  {scoreStr}{bestMark}\n" +
-                        $"  [grey]{statusLine}[/]";
+                    ctx.UpdateTarget(BuildOptimizationPanel(logLines, iterStatus, iterSub, iterDone, maxIter));
                 }
             });
+
+        llamaServer.SetLogHandler(null);
 
         AnsiConsole.WriteLine();
         BenchmarkDisplay.RenderFinalResults(session, _serverExecutable);
@@ -397,9 +470,25 @@ public class MainMenu(
                         ? ValidationResult.Success()
                         : ValidationResult.Error("Name cannot be empty")));
 
-            var profile = SavedProfile.FromSettings(name.Trim(), _modelPath, _manualSettings);
-            profileLibrary.SaveAsync(profile).GetAwaiter().GetResult();
-            AnsiConsole.MarkupLine($"[green]Profile saved:[/] {Markup.Escape(profile.Name)}");
+            name = name.Trim();
+
+            var existing = profileLibrary.FindByNameAsync(name).GetAwaiter().GetResult();
+            bool doSave = true;
+            if (existing is not null)
+            {
+                AnsiConsole.MarkupLine($"[yellow]Warning:[/] A profile named [cyan]{Markup.Escape(name)}[/] already exists.");
+                if (!AnsiConsole.Confirm("Overwrite it?", false))
+                    doSave = false;
+                else
+                    profileLibrary.Delete(existing);
+            }
+
+            if (doSave)
+            {
+                var profile = SavedProfile.FromSettings(name, _modelPath, _manualSettings);
+                profileLibrary.SaveAsync(profile).GetAwaiter().GetResult();
+                AnsiConsole.MarkupLine($"[green]Profile saved:[/] {Markup.Escape(profile.Name)}");
+            }
         }
 
         AnsiConsole.WriteLine();
@@ -417,11 +506,28 @@ public class MainMenu(
                     ? ValidationResult.Success()
                     : ValidationResult.Error("Name cannot be empty")));
 
+        name = name.Trim();
+
+        // Warn if a profile with this name already exists
+        var existing = await profileLibrary.FindByNameAsync(name);
+        if (existing is not null)
+        {
+            AnsiConsole.MarkupLine($"[yellow]Warning:[/] A profile named [cyan]{Markup.Escape(name)}[/] already exists.");
+            if (existing.BenchmarkScore.HasValue)
+                AnsiConsole.MarkupLine($"  [grey]Existing score: {existing.BenchmarkScore:F3}  TG={existing.BenchmarkTgRate:F0}t/s[/]");
+            if (!AnsiConsole.Confirm("Overwrite it?", false))
+            {
+                AnsiConsole.MarkupLine("[grey]Save cancelled.[/]");
+                return;
+            }
+            profileLibrary.Delete(existing);
+        }
+
         string? notes = AnsiConsole.Prompt(
             new TextPrompt<string>("Optional notes (empty to skip):")
                 .AllowEmpty());
 
-        var profile = SavedProfile.FromSession(session, name.Trim());
+        var profile = SavedProfile.FromSession(session, name);
         if (!string.IsNullOrWhiteSpace(notes)) profile.Notes = notes;
 
         await profileLibrary.SaveAsync(profile);
@@ -696,6 +802,50 @@ public class MainMenu(
 
         AnsiConsole.WriteLine("Press any key...");
         Console.ReadKey(intercept: true);
+    }
+
+    // -------------------------------------------------------------------------
+    // Optimization live panel
+    // -------------------------------------------------------------------------
+
+    private static IRenderable BuildOptimizationPanel(
+        Queue<string> logLines,
+        string iterStatus,
+        string iterSub,
+        int iterDone,
+        int maxIter)
+    {
+        var parts = new List<IRenderable>();
+
+        // Scrolling server log
+        if (logLines.Count > 0)
+        {
+            var logRows = new List<IRenderable>();
+            foreach (var line in logLines)
+                logRows.Add(new Text(line, new Style(Color.Grey)));
+
+            parts.Add(new Panel(new Rows(logRows))
+            {
+                Header = new PanelHeader("[grey dim]llama-server log[/]"),
+                Border = BoxBorder.Rounded,
+                BorderStyle = new Style(Color.Grey),
+                Padding = new Padding(1, 0),
+            });
+        }
+
+        // Progress line
+        double pct = maxIter > 0 ? (double)iterDone / (maxIter + 1) * 100.0 : 0;
+        int barWidth = 30;
+        int filled = (int)(barWidth * pct / 100.0);
+        string bar = $"[cyan]{new string('█', filled)}[/]{new string('░', barWidth - filled)}";
+        string progress = $"{bar}  {pct:F0}%  ({iterDone}/{maxIter + 1})";
+
+        parts.Add(new Markup(iterStatus));
+        if (!string.IsNullOrEmpty(iterSub))
+            parts.Add(new Markup($"  [grey]{iterSub}[/]"));
+        parts.Add(new Markup(progress));
+
+        return new Rows(parts);
     }
 
     // -------------------------------------------------------------------------

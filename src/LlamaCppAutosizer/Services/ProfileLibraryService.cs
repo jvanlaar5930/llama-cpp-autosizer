@@ -91,6 +91,15 @@ public class ProfileLibraryService(ILogger<ProfileLibraryService> logger)
     }
 
     /// <summary>
+    /// Returns the first saved profile whose name matches (case-insensitive), or null.
+    /// </summary>
+    public async Task<SavedProfile?> FindByNameAsync(string name)
+    {
+        var all = await ListProfilesAsync();
+        return all.FirstOrDefault(p => string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
     /// Checks whether the model file referenced by the profile still exists on disk.
     /// </summary>
     public static bool IsModelAvailable(SavedProfile profile)

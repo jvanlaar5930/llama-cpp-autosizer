@@ -168,7 +168,7 @@ public static class SettingsEditor
         if (s.RopeScaling is not null)
             table.AddRow("rope-scaling", $"[cyan]{s.RopeScaling}[/]", "");
         if (!string.IsNullOrWhiteSpace(s.ExtraArgs))
-            table.AddRow("extra-args", $"[yellow]{s.ExtraArgs}[/]", "user-provided");
+            table.AddRow("extra-args", $"[yellow]{Markup.Escape(s.ExtraArgs)}[/]", "user-provided");
 
         AnsiConsole.Write(table);
     }

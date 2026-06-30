@@ -142,7 +142,7 @@ public static class BenchmarkDisplay
                     .AddRow("[grey]PP speed[/]", $"[cyan]{r.PromptProcessingRate:F1} t/s[/]")
                     .AddRow("[grey]TG speed[/]", $"[cyan]{r.GenerationRate:F1} t/s[/]")
                     .AddRow("[grey]TTFT[/]", $"[cyan]{r.TimeToFirstTokenMs:F0} ms[/]")
-                    .AddRow("[grey]Completion[/]", $"[grey]{session.CompletionReason}[/]"))
+                    .AddRow("[grey]Completion[/]", $"[grey]{Markup.Escape(session.CompletionReason ?? "")}[/]"))
             {
                 Header = new PanelHeader("[bold]Results Summary[/]"),
                 Border = BoxBorder.Rounded,

@@ -101,6 +101,11 @@ public class UsageInfo
     [JsonPropertyName("completion_tokens")] public int CompletionTokens { get; init; }
 }
 
+public readonly record struct LlamaMetrics(
+    double TokensPredictedTotal,
+    double PromptTokensTotal,
+    double RequestsProcessing);
+
 // -------------------------------------------------------------------------
 // Service
 // -------------------------------------------------------------------------
@@ -297,6 +302,46 @@ public class LlamaServerService(
 
         ct.ThrowIfCancellationRequested();
         throw new TimeoutException("llama-server did not become healthy within 120 seconds.");
+    }
+
+    /// <summary>
+    /// Polls llama-server's Prometheus /metrics endpoint (enabled by default via --metrics).
+    /// Returns null if the server isn't reachable or metrics aren't available.
+    /// </summary>
+    public async Task<LlamaMetrics?> GetMetricsAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            using var http = httpClientFactory.CreateClient();
+            http.Timeout = TimeSpan.FromSeconds(2);
+            string text = await http.GetStringAsync($"{BaseUrl}/metrics", ct);
+
+            double tokensPredicted = ParsePrometheusValue(text, "llamacpp:tokens_predicted_total");
+            double promptTokens = ParsePrometheusValue(text, "llamacpp:prompt_tokens_total");
+            double requestsProcessing = ParsePrometheusValue(text, "llamacpp:requests_processing");
+
+            return new LlamaMetrics(tokensPredicted, promptTokens, requestsProcessing);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            return null;
+        }
+    }
+
+    private static double ParsePrometheusValue(string metricsText, string metricName)
+    {
+        foreach (var line in metricsText.AsSpan().EnumerateLines())
+        {
+            if (line.IsEmpty || line[0] == '#') continue;
+            if (!line.StartsWith(metricName)) continue;
+
+            int spaceIdx = line.LastIndexOf(' ');
+            if (spaceIdx < 0) continue;
+
+            if (double.TryParse(line[(spaceIdx + 1)..], System.Globalization.CultureInfo.InvariantCulture, out double value))
+                return value;
+        }
+        return 0;
     }
 
     public void SetLogHandler(Action<string>? handler) => _logHandler = handler;

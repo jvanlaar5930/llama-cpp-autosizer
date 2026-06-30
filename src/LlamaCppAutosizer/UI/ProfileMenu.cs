@@ -143,7 +143,25 @@ public class ProfileMenu(
         server.SetLogHandler(logQueue.Enqueue);
 
         var stopCts = new CancellationTokenSource();
-        _ = Task.Run(() => { Console.ReadKey(true); stopCts.Cancel(); });
+        bool showFullLog = false;
+        _ = Task.Run(() =>
+        {
+            while (!stopCts.IsCancellationRequested)
+            {
+                if (Console.KeyAvailable)
+                {
+                    var key = Console.ReadKey(intercept: true);
+                    if (key.Key == ConsoleKey.L)
+                        showFullLog = !showFullLog;
+                    else
+                        stopCts.Cancel();
+                }
+                else
+                {
+                    Thread.Sleep(20);
+                }
+            }
+        });
 
         int? pid = server.ServerProcessId;
         var prevCpuTime = TimeSpan.Zero;
@@ -151,10 +169,15 @@ public class ProfileMenu(
         (int GpuPct, long UsedMb, long TotalMb)? gpuStats = null;
         int gpuPollTick = 0;
         var logLines = new Queue<string>();
-        const int MaxLogLines = 20;
+        const int MaxLogLines = 500;
 
-        await AnsiConsole.Live(BuildRunningPanel(profile, null, null, []))
+        LlamaMetrics? prevMetrics = null;
+        var prevMetricsSample = DateTime.UtcNow;
+        double? liveTokPerSec = null;
+
+        await AnsiConsole.Live(BuildRunningPanel(profile, null, null, [], false, null))
             .AutoClear(false)
+            .Overflow(VerticalOverflow.Crop)
             .StartAsync(async ctx =>
             {
                 while (!stopCts.IsCancellationRequested)
@@ -194,7 +217,27 @@ public class ProfileMenu(
                     if (gpuPollTick++ % 3 == 0)
                         gpuStats = await GetGpuStatsAsync();
 
-                    ctx.UpdateTarget(BuildRunningPanel(profile, procStats, gpuStats, [.. logLines]));
+                    // Live generation throughput from llama-server's /metrics, derived from
+                    // the delta of cumulative predicted-token count between polls.
+                    var metrics = await server.GetMetricsAsync(stopCts.Token);
+                    if (metrics is not null)
+                    {
+                        var now = DateTime.UtcNow;
+                        if (prevMetrics is not null && metrics.Value.RequestsProcessing > 0)
+                        {
+                            double tokenDelta = metrics.Value.TokensPredictedTotal - prevMetrics.Value.TokensPredictedTotal;
+                            double secondsDelta = (now - prevMetricsSample).TotalSeconds;
+                            liveTokPerSec = secondsDelta > 0 && tokenDelta >= 0 ? tokenDelta / secondsDelta : liveTokPerSec;
+                        }
+                        else if (metrics.Value.RequestsProcessing == 0)
+                        {
+                            liveTokPerSec = null; // idle — nothing generating right now
+                        }
+                        prevMetrics = metrics;
+                        prevMetricsSample = now;
+                    }
+
+                    ctx.UpdateTarget(BuildRunningPanel(profile, procStats, gpuStats, [.. logLines], showFullLog, liveTokPerSec));
 
                     try { await Task.Delay(1000, stopCts.Token); }
                     catch (TaskCanceledException) { break; }
@@ -213,8 +256,14 @@ public class ProfileMenu(
         SavedProfile profile,
         (double CpuPct, double RamGb)? proc,
         (int GpuPct, long UsedMb, long TotalMb)? gpu,
-        string[] logs)
+        string[] logs,
+        bool showFullLog,
+        double? liveTokPerSec)
     {
+        if (showFullLog)
+            return BuildFullLogPanel(logs, liveTokPerSec);
+
+
         var s = profile.Settings;
         bool isMoe = s.MoeExpertUsed.HasValue;
         bool isThinking = s.ThinkingEnabled.HasValue;
@@ -276,6 +325,9 @@ public class ProfileMenu(
             info.AddRow("[grey]GPU[/]", FormatPct(gpu.Value.GpuPct));
             info.AddRow("[grey]VRAM[/]", $"[cyan]{gpu.Value.UsedMb / 1024.0:F1} / {gpu.Value.TotalMb / 1024.0:F1} GB[/]");
         }
+        info.AddRow("[grey]Live TG[/]", liveTokPerSec.HasValue
+            ? $"[green]{liveTokPerSec.Value:F1} t/s[/]"
+            : "[dim]idle[/]");
 
         if (!string.IsNullOrWhiteSpace(profile.Notes))
         {
@@ -285,16 +337,54 @@ public class ProfileMenu(
 
         List<IRenderable> parts = [new Padder(info, new Padding(1, 0))];
 
-        if (logs.Length > 0)
+        // Keep the panel within the console window — Spectre's Live display doesn't
+        // overwrite cleanly when a frame is taller than the terminal, which produces
+        // a runaway stack of duplicated, truncated panels instead of one in-place update.
+        const int MaxTailLogLines = 8;
+        const int ChromeRows = 4; // top+bottom border, plus safety margin for cursor drift
+        int available = Math.Max(0, Console.WindowHeight - info.Rows.Count - ChromeRows);
+        int tailLogLines = logs.Length > 0 ? Math.Clamp(available - 1, 0, MaxTailLogLines) : 0;
+
+        if (tailLogLines > 0)
         {
             parts.Add(new Rule("[grey dim]logs[/]").RuleStyle("grey dim"));
-            foreach (var line in logs)
+            foreach (var line in logs.Skip(Math.Max(0, logs.Length - tailLogLines)))
                 parts.Add(new Text(line));
         }
 
         var panel = new Panel(new Rows(parts))
         {
-            Header = new PanelHeader("[bold green] Server Running [/]  [grey]press any key to stop[/]"),
+            Header = new PanelHeader("[bold green] Server Running [/]  [grey]L = full logs   any other key = stop[/]"),
+            Border = BoxBorder.Double,
+            Padding = new Padding(0, 0),
+        };
+
+        return panel;
+    }
+
+    private static IRenderable BuildFullLogPanel(string[] logs, double? liveTokPerSec)
+    {
+        // Chrome: top+bottom border (2), live-gen line + rule (2), plus safety margin
+        // for cursor drift — Live's relative redraw breaks if a frame forces the
+        // terminal to scroll, so we deliberately stay a few lines under the window.
+        int height = Math.Max(3, Console.WindowHeight - 9);
+        var tail = logs.Skip(Math.Max(0, logs.Length - height)).ToList();
+
+        var rows = new List<IRenderable>
+        {
+            new Markup(liveTokPerSec.HasValue
+                ? $"[grey]Live generation:[/] [bold green]{liveTokPerSec.Value:F1} t/s[/]"
+                : "[grey]Live generation:[/] [dim]idle[/]"),
+            new Rule().RuleStyle("grey dim"),
+        };
+        foreach (var line in tail)
+            rows.Add(new Text(line));
+        if (tail.Count == 0)
+            rows.Add(new Text("[waiting for output...]", new Style(Color.Grey)));
+
+        var panel = new Panel(new Rows(rows))
+        {
+            Header = new PanelHeader("[bold green] Server Running — Full Log [/]  [grey]L = back to summary   any other key = stop[/]"),
             Border = BoxBorder.Double,
             Padding = new Padding(0, 0),
         };
@@ -305,7 +395,7 @@ public class ProfileMenu(
     private static string FormatPct(double pct)
     {
         var col = pct > 90 ? "red" : pct > 70 ? "yellow" : "green";
-        return $"[{col}]{pct:F1}%[/{col}]";
+        return $"[{col}]{pct:F1}%[/]";
     }
 
     private static async Task<(int GpuPct, long UsedMb, long TotalMb)?> GetGpuStatsAsync()

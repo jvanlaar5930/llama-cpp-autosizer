@@ -60,7 +60,6 @@ public class LlamaSettings
             "--parallel", ParallelSlots.ToString(),
             "--port", port.ToString(),
             "--metrics",
-            "--log-disable",
         };
 
         if (Threads >= 0) { args.Add("--threads"); args.Add(Threads.ToString()); }
