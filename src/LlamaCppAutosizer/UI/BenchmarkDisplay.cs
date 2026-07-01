@@ -155,6 +155,47 @@ public static class BenchmarkDisplay
         RenderIterationHistory(session);
     }
 
+    /// <summary>
+    /// If multiple iterations were progressively "best" during the run, lets the user
+    /// choose which one to save. Returns the single overall best when there is no choice.
+    /// </summary>
+    public static OptimizationIteration? SelectBestIteration(OptimizationSession session)
+    {
+        // All iterations that were a progressive best (score improved to a new high).
+        // Ordered best-first so the default selection is the highest-scoring one.
+        var stars = session.Iterations
+            .Where(i => i.IsBestSoFar && i.Result.CompositeScore > 0)
+            .OrderByDescending(i => i.Result.CompositeScore)
+            .ToList();
+
+        if (stars.Count == 0) return session.Best;
+        if (stars.Count == 1) return stars[0];
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(new Rule("[bold yellow]Multiple best iterations found[/]").RuleStyle("yellow"));
+        AnsiConsole.MarkupLine("[grey]Select which settings to use:[/]");
+        AnsiConsole.WriteLine();
+
+        // Build display labels (no Markup inside SelectionPrompt labels — they're plain text)
+        var labels = stars.Select(i =>
+        {
+            string change = i.Number == 0 ? "baseline"
+                : i.AppliedChange is null ? "?"
+                : $"{i.AppliedChange.Parameter} → {i.AppliedChange.NewValue}";
+            return $"Iter {i.Number,2}  score={i.Result.CompositeScore:F3}  " +
+                   $"TG={i.Result.GenerationRate:F1}t/s  PP={i.Result.PromptProcessingRate:F1}t/s  " +
+                   $"ctx={i.Settings.ContextSize:N0}  [{change}]";
+        }).ToList();
+
+        var picked = AnsiConsole.Prompt(
+            new SelectionPrompt<string>()
+                .Title("[grey]Which iteration should become the saved profile?[/]")
+                .PageSize(12)
+                .AddChoices(labels));
+
+        return stars[labels.IndexOf(picked)];
+    }
+
     public static void RenderSessionList(List<string> sessionFiles)
     {
         if (sessionFiles.Count == 0)

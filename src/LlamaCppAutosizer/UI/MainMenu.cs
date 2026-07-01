@@ -586,13 +586,14 @@ public class MainMenu(
             AnsiConsole.MarkupLine($"[green]Exported to {Markup.Escape(path)}[/]");
         }
 
-        _manualSettings = session.BestSettings ?? _manualSettings;
+        // Let the user pick which starred iteration to use (prompts only if multiple exist)
+        var chosenIter = BenchmarkDisplay.SelectBestIteration(session);
+        _manualSettings = chosenIter?.Settings ?? session.BestSettings ?? _manualSettings;
 
-        // Offer to save the best settings as a named profile for future use
-        if (session.BestSettings is not null &&
+        if (chosenIter is not null &&
             AnsiConsole.Confirm("\nSave best settings as a named profile?", true))
         {
-            await SaveProfileFromSessionAsync(session);
+            await SaveProfileFromSessionAsync(session, chosenIter);
         }
     }
 
@@ -639,7 +640,9 @@ public class MainMenu(
         Console.ReadKey(intercept: true);
     }
 
-    private async Task SaveProfileFromSessionAsync(OptimizationSession session)
+    private async Task SaveProfileFromSessionAsync(
+        OptimizationSession session,
+        OptimizationIteration? chosenIteration = null)
     {
         string defaultName = $"{session.ModelName} — {session.Profile}";
         string name = AnsiConsole.Prompt(
@@ -670,7 +673,7 @@ public class MainMenu(
             new TextPrompt<string>("Optional notes (empty to skip):")
                 .AllowEmpty());
 
-        var profile = SavedProfile.FromSession(session, name);
+        var profile = SavedProfile.FromSession(session, name, chosenIteration);
         if (!string.IsNullOrWhiteSpace(notes)) profile.Notes = notes;
 
         await profileLibrary.SaveAsync(profile);
@@ -868,7 +871,8 @@ public class MainMenu(
         if (session.BestSettings is not null &&
             AnsiConsole.Confirm("Apply best settings from this session?", true))
         {
-            _manualSettings = session.BestSettings;
+            var chosen = BenchmarkDisplay.SelectBestIteration(session);
+            _manualSettings = chosen?.Settings ?? session.BestSettings;
             _modelPath = session.ModelPath;
             AnsiConsole.MarkupLine("[green]Settings applied.[/]");
         }

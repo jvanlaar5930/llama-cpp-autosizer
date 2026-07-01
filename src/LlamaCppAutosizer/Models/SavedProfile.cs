@@ -33,15 +33,21 @@ public class SavedProfile
         return parts.Count > 0 ? string.Join("  ", parts) : Settings.Summary();
     }
 
-    /// <summary>Creates a SavedProfile from the best result of a completed session.</summary>
-    public static SavedProfile FromSession(OptimizationSession session, string name)
+    /// <summary>Creates a SavedProfile from a completed session.
+    /// Pass <paramref name="chosenIteration"/> to use a specific starred iteration
+    /// instead of the automatic best (highest score).</summary>
+    public static SavedProfile FromSession(
+        OptimizationSession session,
+        string name,
+        OptimizationIteration? chosenIteration = null)
     {
-        var r = session.BestResult;
+        var iter = chosenIteration ?? session.Best;
+        var r = iter?.Result;
         return new SavedProfile
         {
             Name = name,
             ModelPath = session.ModelPath,
-            Settings = session.BestSettings!.Clone(),
+            Settings = (iter?.Settings ?? session.BestSettings!).Clone(),
             OptimizationProfile = session.Profile,
             BenchmarkScore = r?.CompositeScore,
             BenchmarkPpRate = r?.PromptProcessingRate,
