@@ -43,6 +43,11 @@ public class BenchmarkResult
     public double QualityScore { get; set; }
     public double ToolSuccessRate { get; set; }  // agentic only
 
+    // Fraction of accuracy prompts answered correctly (1.0 when the profile defines none).
+    // Folded into QualityScore so degraded configs (aggressive KV quant, too few MoE
+    // experts) lose score even when their output is fluent.
+    public double AccuracyScore { get; set; } = 1.0;
+
     // Final composite score for this profile (set by profile scorer)
     public double CompositeScore { get; set; }
 

@@ -7,6 +7,25 @@ public class ParameterChange
     public object? NewValue { get; init; }
     public string Reasoning { get; init; } = "";
     public string Source { get; init; } = "heuristic";   // "heuristic" | "llm" | "user"
+
+    // Optional second change applied atomically with this one — used by the final-push
+    // recommender to explore parameter combinations a single greedy step can't reach.
+    public ParameterChange? Combined { get; init; }
+
+    /// <summary>This change followed by any combined changes, flattened.</summary>
+    public IEnumerable<ParameterChange> Chain()
+    {
+        yield return this;
+        if (Combined is not null)
+            foreach (var c in Combined.Chain()) yield return c;
+    }
+
+    /// <summary>All parameter names touched by this change, including combined ones.</summary>
+    public IEnumerable<string> ParameterNames() => Chain().Select(c => c.Parameter);
+
+    /// <summary>"Param → value" display, chaining combined changes with " + ".</summary>
+    public string Describe() =>
+        $"{Parameter} → {NewValue ?? "default"}" + (Combined is null ? "" : $" + {Combined.Describe()}");
 }
 
 public class OptimizationIteration
@@ -17,6 +36,10 @@ public class OptimizationIteration
     public ParameterChange? AppliedChange { get; init; }
     public bool IsBestSoFar { get; set; }
     public string? StatusMessage { get; set; }
+
+    // End-of-run re-benchmark of the champion config. Excluded from Best ranking —
+    // its measurements are folded into the champion iteration's result instead.
+    public bool IsVerification { get; init; }
 }
 
 public class OptimizationSession
@@ -36,31 +59,46 @@ public class OptimizationSession
     // User-configurable per run (see MainMenu's optimization setup prompt); 30 t/s default.
     public double TargetTgSpeed { get; set; } = 30.0;
 
+    // Quality scores below this indicate degenerate output (e.g. a repetition loop) —
+    // such configs are never preferred as Best while a healthy alternative exists, and
+    // the heuristic recommender treats them as "fix quality before chasing speed".
+    public const double MinHealthyQuality = 0.3;
+
     /// <summary>
     /// The iteration that future recommendations should branch from, and the one reported
     /// as the run's result.
     ///
-    /// Below the speed target: highest composite score seen (as before) — chase the best
-    /// available speed/quality balance.
+    /// Below the speed target: highest composite score seen — chase the best available
+    /// speed/quality balance.
     ///
-    /// At/above the speed target: the *latest* iteration that still clears the target, even
-    /// if its composite score is lower than an earlier, faster-but-lower-quality iteration.
+    /// At/above the speed target: the most *capable* iteration that still clears the target —
+    /// healthy output first, then largest context, then most MoE experts, then composite score.
     /// This lets quality-oriented moves (restoring MoE experts, growing context) stick as the
-    /// new anchor and keep chaining forward, rather than snapping back to a faster config just
-    /// because it scored higher on the speed-weighted composite metric.
+    /// new anchor even though they lower the speed-weighted composite score, while a move that
+    /// merely lost speed with no capability gain does NOT displace the anchor (ranking by
+    /// recency here caused the optimizer to anchor on worse configs and then oscillate by
+    /// reverting them, re-benchmarking configurations it had already run).
     /// </summary>
     public OptimizationIteration? Best
     {
         get
         {
-            // Skip start-failure placeholders (GenerationRate == 0 means the benchmark never ran).
-            var valid = Iterations.Where(i => i.Result.GenerationRate > 0).ToList();
+            // Skip start-failure placeholders (GenerationRate == 0 means the benchmark never
+            // ran) and end-of-run verification re-benchmarks (their measurements are folded
+            // into the champion iteration they verify).
+            var valid = Iterations.Where(i => i.Result.GenerationRate > 0 && !i.IsVerification).ToList();
             if (valid.Count == 0) return Iterations.MaxBy(i => i.Result.CompositeScore);
 
             var meetingTarget = valid.Where(i => i.Result.GenerationRate >= TargetTgSpeed).ToList();
-            return meetingTarget.Count > 0
-                ? meetingTarget.MaxBy(i => i.Number)
-                : valid.MaxBy(i => i.Result.CompositeScore);
+            if (meetingTarget.Count == 0) return valid.MaxBy(i => i.Result.CompositeScore);
+
+            return meetingTarget
+                .OrderBy(i => i.Result.QualityScore >= MinHealthyQuality) // degenerate output loses to any healthy config
+                .ThenBy(i => i.Settings.ContextSize)
+                .ThenBy(i => i.Settings.MoeExpertUsed ?? int.MaxValue)    // null = model default = full quality
+                .ThenBy(i => i.Result.CompositeScore)
+                .ThenBy(i => i.Number)
+                .Last();
         }
     }
 
@@ -85,5 +123,16 @@ public class OptimizationSession
     {
         Iterations.Add(iter);
         iter.IsBestSoFar = Best == iter;
+    }
+
+    /// <summary>
+    /// True if a configuration identical to <paramref name="candidate"/> has already been
+    /// benchmarked (or attempted — start failures count too) in this session. Used to stop
+    /// the optimizer from re-running settings it has already measured.
+    /// </summary>
+    public bool HasTestedConfiguration(LlamaSettings candidate)
+    {
+        var fp = candidate.Fingerprint();
+        return Iterations.Any(i => i.Settings.Fingerprint() == fp);
     }
 }

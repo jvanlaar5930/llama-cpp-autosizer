@@ -8,7 +8,8 @@ public record OptimizationOptions(
     double ConvergenceThreshold = 0.01,
     int ConvergencePatience = 3,
     int Port = 8080,
-    bool IncludeRepetitionStressTest = false
+    bool IncludeRepetitionStressTest = false,
+    bool VerifyBestAtEnd = true
 );
 
 public class OptimizerService(
@@ -73,26 +74,34 @@ public class OptimizerService(
             yield return baseline;
 
             // ── Iterative tuning ──────────────────────────────────────────────
-            // consecutiveNonImprovements: resets on any iteration that beats the best score.
-            // When it hits 3 we ask the LLM for a completely fresh angle ("final push").
+            // consecutiveNonImprovements: resets on any iteration that makes meaningful
+            // progress (capability gain, or a composite gain of at least ConvergenceThreshold —
+            // smaller gains are indistinguishable from benchmark noise). When it reaches
+            // ConvergencePatience we ask the LLM for a completely fresh angle ("final push").
             // If the LLM says DONE → stop early. Otherwise reset the counter and continue.
             // We never stop just because the normal recommendation pool is exhausted —
             // instead we trigger the final-push path there too.
             int consecutiveNonImprovements = 0;
             int consecutiveStartFailures = 0;
-            const int MaxConsecutiveNonImprovements = 3;
+            int maxConsecutiveNonImprovements = Math.Max(1, options.ConvergencePatience);
             const int MaxConsecutiveStartFailures = 5;
 
             for (int iter = 1; iter <= options.MaxIterations && !ct.IsCancellationRequested; iter++)
             {
+                // Refresh hardware readings while the previous iteration's server is still
+                // running — recommendations then see real remaining VRAM/RAM headroom with
+                // the model loaded, not the stale pre-load numbers from session start.
+                hw = await hardware.DetectAsync();
+
                 // ── Pick the next change to try ───────────────────────────────
                 ParameterChange? change;
 
-                if (consecutiveNonImprovements >= MaxConsecutiveNonImprovements)
+                if (consecutiveNonImprovements >= maxConsecutiveNonImprovements)
                 {
-                    // 3 consecutive non-improvements: present best to LLM and ask for a new angle
+                    // Patience exhausted: present best to LLM and ask for a new angle
                     consecutiveNonImprovements = 0;
-                    logger.LogInformation("3 consecutive non-improvements — asking LLM for final push");
+                    logger.LogInformation("{N} consecutive non-improvements — asking LLM for final push",
+                        maxConsecutiveNonImprovements);
 
                     change = await recommender.GetFinalPushAsync(session, profile, hw, ct);
                     if (change is null)
@@ -121,8 +130,8 @@ public class OptimizerService(
                 var nextSettings = RecommendationService.Apply(session.BestSettings!, change);
                 nextSettings.Label = $"iter{iter}";
 
-                logger.LogInformation("Iteration {N}: {Param} → {Val} [{Source}]",
-                    iter, change.Parameter, change.NewValue, change.Source);
+                logger.LogInformation("Iteration {N}: {Change} [{Source}]",
+                    iter, change.Describe(), change.Source);
 
                 // ── Start server with new settings ────────────────────────────
                 await StopServerAsync();
@@ -143,8 +152,8 @@ public class OptimizerService(
                     startFailReason = ex.Message;
                     consecutiveStartFailures++;
                     logger.LogInformation(
-                        "Server failed to start with {Param}={Val} ({Reason})",
-                        change.Parameter, change.NewValue, ex.Message);
+                        "Server failed to start with {Change} ({Reason})",
+                        change.Describe(), ex.Message);
 
                     // Restore best settings so the server stays available for LLM prompts
                     try { await StartServerAsync(serverExecutable, modelPath, session.BestSettings!, options.Port, ct); }
@@ -172,7 +181,7 @@ public class OptimizerService(
                         Settings = nextSettings,
                         Result = new BenchmarkResult(),
                         AppliedChange = change,
-                        StatusMessage = $"[{sourceLabel}] {change.Parameter} → {change.NewValue}  [SKIP — server failed to start]",
+                        StatusMessage = $"[{sourceLabel}] {change.Describe()}  [SKIP — server failed to start]",
                     };
                     session.AddIteration(skipped);
                     yield return skipped;
@@ -181,17 +190,64 @@ public class OptimizerService(
                     continue;
                 }
 
+                // ── Duplicate guard ───────────────────────────────────────────
+                // The recommender refuses changes that recreate a tested config, but the
+                // server's startup auto-adjustments (e.g. reverting an unsupported KV quant)
+                // can still land us back on one. Re-benchmarking it would just duplicate a
+                // known data point — record a visible skip and move on.
+                if (session.HasTestedConfiguration(nextSettings))
+                {
+                    string dupNote = startAdjustment is null ? "" : $" after auto-adjustment: {startAdjustment}";
+                    var duplicate = new OptimizationIteration
+                    {
+                        Number = iter,
+                        Settings = nextSettings,
+                        Result = new BenchmarkResult(),
+                        AppliedChange = change,
+                        StatusMessage = $"[{SourceTag(change.Source)}] {change.Describe()}  [SKIP — configuration already benchmarked{dupNote}]",
+                    };
+                    session.AddIteration(duplicate);
+                    await persistence.SaveAsync(session);
+                    yield return duplicate;
+                    consecutiveNonImprovements++;
+                    continue;
+                }
+
                 // ── Benchmark ─────────────────────────────────────────────────
-                BenchmarkResult iterResult;
+                BenchmarkResult? iterResult = null;
+                string? benchFailReason = null;
                 try
                 {
                     iterResult = await benchmarks.RunAsync(nextSettings, modelPath, profile, ct,
                         options.IncludeRepetitionStressTest);
                     iterResult.CompositeScore = profile.ScoreResult(iterResult);
                 }
+                catch (OperationCanceledException)
+                {
+                    break;  // user cancelled — the finally block records the reason
+                }
                 catch (Exception ex)
                 {
-                    logger.LogInformation("Benchmark failed ({Reason}); counting as non-improvement", ex.Message);
+                    benchFailReason = ex.Message;
+                    logger.LogInformation("Benchmark failed ({Reason}); recording as skipped iteration", ex.Message);
+                }
+
+                // Record benchmark failures as visible skipped iterations. This feeds the
+                // config into the duplicate guard and the LLM's history (so it isn't
+                // suggested again), instead of silently vanishing from the record.
+                if (iterResult is null)
+                {
+                    var benchFailed = new OptimizationIteration
+                    {
+                        Number = iter,
+                        Settings = nextSettings,
+                        Result = new BenchmarkResult { Notes = $"Benchmark failed: {benchFailReason}" },
+                        AppliedChange = change,
+                        StatusMessage = $"[{SourceTag(change.Source)}] {change.Describe()}  [SKIP — benchmark failed: {benchFailReason}]",
+                    };
+                    session.AddIteration(benchFailed);
+                    await persistence.SaveAsync(session);
+                    yield return benchFailed;
                     consecutiveNonImprovements++;
                     continue;
                 }
@@ -204,18 +260,78 @@ public class OptimizerService(
                     Settings = nextSettings,
                     Result = iterResult,
                     AppliedChange = change,
-                    StatusMessage = $"[{tag}] {change.Parameter} → {change.NewValue}  \"{change.Reasoning}\"{adjustmentSuffix}",
+                    StatusMessage = $"[{tag}] {change.Describe()}  \"{change.Reasoning}\"{adjustmentSuffix}",
                 };
+                var prevAnchor = session.Best;
                 session.AddIteration(iteration);
                 await persistence.SaveAsync(session);
 
                 yield return iteration;
 
                 // ── Track non-improvement streak ──────────────────────────────
-                if (iteration.IsBestSoFar)
+                // Becoming the anchor only counts as progress when the gain is meaningful:
+                // a capability gain, or a composite gain of at least ConvergenceThreshold.
+                // Sub-threshold gains are indistinguishable from benchmark noise, so they
+                // keep the convergence counter running even though the anchor advanced.
+                bool meaningfulImprovement = iteration.IsBestSoFar &&
+                    (prevAnchor is null
+                     || HasCapabilityGain(iteration, prevAnchor)
+                     || iteration.Result.CompositeScore - prevAnchor.Result.CompositeScore
+                            >= options.ConvergenceThreshold);
+                if (meaningfulImprovement)
                     consecutiveNonImprovements = 0;
                 else
                     consecutiveNonImprovements++;
+            }
+
+            // ── Champion verification ─────────────────────────────────────────
+            // Re-benchmark the winning configuration once and fold the second sample into
+            // its reported metrics. A single measurement can win on noise or an early
+            // (cooler) thermal state; the second run happens under the same late-run
+            // conditions as its rivals, making the reported result trustworthy.
+            var champion = session.Best;
+            bool shouldVerify = options.VerifyBestAtEnd
+                && !ct.IsCancellationRequested
+                && server.IsRunning   // false after a fatal start failure — no point retrying
+                && champion is not null
+                && champion.Result.GenerationRate > 0
+                && session.Iterations.Count(i => i.Result.GenerationRate > 0) > 1;
+
+            if (shouldVerify)
+            {
+                OptimizationIteration? verification = null;
+                var champ = champion!;
+                try
+                {
+                    var verifySettings = champ.Settings.Clone();
+                    verifySettings.Label = "verify";
+                    await StopServerAsync();
+                    await StartServerAsync(serverExecutable, modelPath, verifySettings, options.Port, ct);
+
+                    var verifyResult = await benchmarks.RunAsync(verifySettings, modelPath, profile, ct,
+                        options.IncludeRepetitionStressTest);
+                    verifyResult.CompositeScore = profile.ScoreResult(verifyResult);
+
+                    MergeVerification(champ, verifyResult, profile);
+
+                    verification = new OptimizationIteration
+                    {
+                        Number = session.Iterations.Max(i => i.Number) + 1,
+                        Settings = verifySettings,
+                        Result = verifyResult,
+                        IsVerification = true,
+                        StatusMessage = $"Verification — re-benchmarked best config (iter {champ.Number}); " +
+                                        "its reported metrics now combine both runs",
+                    };
+                    session.AddIteration(verification);
+                    await persistence.SaveAsync(session);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogInformation("Champion verification failed ({Reason}); keeping single-run metrics", ex.Message);
+                }
+                if (verification is not null)
+                    yield return verification;
             }
         }
         finally
@@ -244,6 +360,36 @@ public class OptimizerService(
         "llm-push" => "LLM★",
         _          => "Heuristic",
     };
+
+    // A capability gain is progress even when the speed-weighted composite drops: larger
+    // context, more MoE experts (null = model default = all of them), or recovering
+    // healthy output from a degenerate config.
+    private static bool HasCapabilityGain(OptimizationIteration current, OptimizationIteration previous)
+    {
+        if (current.Settings.ContextSize > previous.Settings.ContextSize) return true;
+        if ((current.Settings.MoeExpertUsed ?? int.MaxValue) > (previous.Settings.MoeExpertUsed ?? int.MaxValue)) return true;
+        return current.Result.QualityScore >= OptimizationSession.MinHealthyQuality
+            && previous.Result.QualityScore < OptimizationSession.MinHealthyQuality;
+    }
+
+    // Folds a verification re-run into the champion's reported metrics: rates and latencies
+    // are averaged (two samples beat one), quality-style scores take the worse of the two
+    // (a repetition loop or a wrong answer in either run means the config can produce them).
+    private static void MergeVerification(
+        OptimizationIteration champion, BenchmarkResult verify, OptimizationProfile profile)
+    {
+        var r = champion.Result;
+        r.PromptProcessingRate = (r.PromptProcessingRate + verify.PromptProcessingRate) / 2;
+        r.GenerationRate = (r.GenerationRate + verify.GenerationRate) / 2;
+        r.TimeToFirstTokenMs = (r.TimeToFirstTokenMs + verify.TimeToFirstTokenMs) / 2;
+        r.AverageTotalMs = (r.AverageTotalMs + verify.AverageTotalMs) / 2;
+        r.QualityScore = Math.Min(r.QualityScore, verify.QualityScore);
+        r.AccuracyScore = Math.Min(r.AccuracyScore, verify.AccuracyScore);
+        r.ToolSuccessRate = Math.Min(r.ToolSuccessRate, verify.ToolSuccessRate);
+        r.CompositeScore = profile.ScoreResult(r);
+        r.Notes = (r.Notes is null ? "" : r.Notes + " ") +
+            "Metrics combined with end-of-run verification re-benchmark.";
+    }
 
     private async Task StartServerAsync(
         string exe, string model, LlamaSettings settings, int port, CancellationToken ct)

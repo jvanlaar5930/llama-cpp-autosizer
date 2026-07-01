@@ -104,6 +104,22 @@ public class LlamaSettings
         return c;
     }
 
+    /// <summary>
+    /// Canonical identity of every setting that affects server behavior (Label excluded).
+    /// Two settings with equal fingerprints launch an identical server, so benchmarking
+    /// both is pure waste — the optimizer uses this to refuse duplicate configurations.
+    /// </summary>
+    public string Fingerprint() => string.Join("|",
+        ContextSize, GpuLayers, BatchSize, UBatchSize,
+        Threads, ThreadsBatch, FlashAttention, Mmap, Mlock,
+        CacheTypeK ?? "f16", CacheTypeV ?? "f16",
+        MoeExpertUsed?.ToString() ?? "default",
+        ThinkingEnabled?.ToString() ?? "default",
+        ParallelSlots, DefragThreshold,
+        RopeScaling ?? "", RopeFreqBase?.ToString() ?? "", RopeFreqScale?.ToString() ?? "",
+        RepeatPenalty?.ToString() ?? "", RepeatLastN?.ToString() ?? "", DryMultiplier?.ToString() ?? "",
+        ExtraArgs ?? "");
+
     /// <summary>Human-readable summary of key parameters.</summary>
     public string Summary()
     {

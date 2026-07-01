@@ -38,6 +38,13 @@ public class RecommendationService(
             try
             {
                 var llmRec = await GetLlmRecommendationAsync(session, profile, hardware, ct);
+                if (llmRec is not null && RecreatesTestedConfig(session, llmRec))
+                {
+                    logger.LogInformation(
+                        "LLM suggested {Param} = {Val}, but that configuration was already benchmarked — falling back to heuristic",
+                        llmRec.Parameter, llmRec.NewValue);
+                    llmRec = null;
+                }
                 if (llmRec is not null)
                 {
                     logger.LogInformation("LLM recommended: {Param} = {Val} — {Reason}",
@@ -53,6 +60,15 @@ public class RecommendationService(
 
         return GetHeuristicRecommendation(session, profile, hardware);
     }
+
+    /// <summary>
+    /// True if applying <paramref name="change"/> to the current best settings would recreate
+    /// a configuration this session has already benchmarked (or attempted). Such a change would
+    /// waste an iteration re-measuring a known result — every recommendation path rejects it.
+    /// </summary>
+    private static bool RecreatesTestedConfig(OptimizationSession session, ParameterChange change)
+        => session.BestSettings is not null
+           && session.HasTestedConfiguration(Apply(session.BestSettings, change));
 
     /// <summary>
     /// "Final push" prompt — used when 3 consecutive iterations haven't improved or when the
@@ -89,6 +105,14 @@ public class RecommendationService(
             var change = ParseLlmResponse(content, session.BestSettings!);
             if (change is null) return null;
 
+            if (RecreatesTestedConfig(session, change))
+            {
+                logger.LogInformation(
+                    "Final-push suggestion {Change} recreates an already-benchmarked configuration — falling back to heuristic",
+                    change.Describe());
+                return GetHeuristicRecommendation(session, profile, hardware);
+            }
+
             // Tag it so the UI can show it as a "final push" iteration
             return new ParameterChange
             {
@@ -97,6 +121,7 @@ public class RecommendationService(
                 NewValue = change.NewValue,
                 Reasoning = change.Reasoning,
                 Source = "llm-push",
+                Combined = change.Combined,
             };
         }
         catch (Exception ex)
@@ -114,7 +139,11 @@ public class RecommendationService(
     private record LlmSuggestion(
         [property: JsonPropertyName("parameter")] string Parameter,
         [property: JsonPropertyName("value")] JsonElement Value,
-        [property: JsonPropertyName("reasoning")] string Reasoning
+        [property: JsonPropertyName("reasoning")] string Reasoning,
+        // Optional second change, only advertised in the final-push prompt — lets the LLM
+        // explore combinations (e.g. flash-attn + smaller ubatch) one greedy step can't reach.
+        [property: JsonPropertyName("parameter2")] string? Parameter2 = null,
+        [property: JsonPropertyName("value2")] JsonElement? Value2 = null
     );
 
     private async Task<ParameterChange?> GetLlmRecommendationAsync(
@@ -153,11 +182,14 @@ public class RecommendationService(
             if (i.Number == 0)
                 return $"  [baseline] score={i.Result.CompositeScore:F3}  " +
                        $"TG={i.Result.GenerationRate:F0}t/s PP={i.Result.PromptProcessingRate:F0}t/s TTFT={i.Result.TimeToFirstTokenMs:F0}ms";
+            string changeDesc = i.AppliedChange?.Describe() ?? "?";
+            if (i.Result.GenerationRate <= 0)
+                return $"  [iter {i.Number}] {changeDesc}  FAILED (server would not start or benchmark errored — do not retry this)";
             double delta = i.Result.CompositeScore - baselineScore;
             string verdict = i.Result.CompositeScore >= best.CompositeScore ? "★ BEST"
                            : delta >= 0 ? $"+{delta:F3} vs baseline"
                            : $"{delta:F3} vs baseline (worse)";
-            return $"  [iter {i.Number}] {i.AppliedChange?.Parameter ?? "?"}={i.AppliedChange?.NewValue}  " +
+            return $"  [iter {i.Number}] {changeDesc}  " +
                    $"score={i.Result.CompositeScore:F3} ({verdict})  " +
                    $"TG={i.Result.GenerationRate:F0}t/s PP={i.Result.PromptProcessingRate:F0}t/s TTFT={i.Result.TimeToFirstTokenMs:F0}ms";
         });
@@ -183,7 +215,7 @@ Study the results so far and suggest ONE parameter change most likely to improve
 You may suggest a different value for a parameter already tried if you think another value will do better.
 
 HARDWARE:
-- GPU: {{(hardware.HasGpu ? $"{hardware.Gpus.FirstOrDefault()?.Name ?? "GPU"} — {hardware.TotalVramMb} MB total, {hardware.FreeVramMb} MB free" : "none (CPU-only)")}}
+- GPU: {{(hardware.HasGpu ? $"{hardware.Gpus.FirstOrDefault()?.Name ?? "GPU"} — {hardware.TotalVramMb} MB total, {hardware.FreeVramMb} MB free (measured with the current model loaded — this is real remaining headroom)" : "none (CPU-only)")}}
 - RAM: {{hardware.RamTotalMb}} MB total, {{hardware.RamFreeMb}} MB free
 - CPU: {{hardware.CpuName}} — {{hardware.CpuCores}} cores / {{hardware.CpuThreads}} threads
 
@@ -209,6 +241,7 @@ GOAL: Target generation speed is {{session.TargetTgSpeed:F0}}t/s.
 - Well above {{session.TargetTgSpeed:F0}}t/s (lots of headroom, e.g. {{session.TargetTgSpeed + LotsOfHeadroomAboveTarget:F0}}t/s+): it's fine to give back some speed for quality — e.g. restore MoE active-expert count toward the model default — as long as TG stays at/above {{session.TargetTgSpeed:F0}}t/s.
 - If the quality score has cratered on the current best (a strong sign of a degenerate repetition loop like "is is is is..."), prioritize RepeatPenalty (e.g. 1.1–1.3), RepeatLastN (e.g. 256), or DryMultiplier (e.g. 0.8) over speed tuning — an unusable output is worse than a faster one.
 RULE: If a parameter made things worse, try something else OR a different value for it. Never suggest changing cache-type-k/cache-type-v purely to "improve quality" — that's a speed/VRAM lever, not a quality one.
+RULE: Never re-suggest a parameter=value pair from the history above unless the best settings have changed since it was tried — recreating an already-benchmarked configuration wastes an iteration and will be rejected.
 
 Valid parameters and example values:
 - GpuLayers: -1 (all layers), or a positive integer up to 200
@@ -240,7 +273,9 @@ Respond with ONLY this JSON (no markdown, no extra text before or after):
 
         var triedSummary = session.Iterations
             .Where(i => i.AppliedChange is not null)
-            .Select(i => $"  {i.AppliedChange!.Parameter}={i.AppliedChange.NewValue} → score={i.Result.CompositeScore:F3} ({(i.IsBestSoFar ? "★ best" : i.Result.CompositeScore >= baselineScore ? "ok" : "worse")})")
+            .Select(i => i.Result.GenerationRate <= 0
+                ? $"  {i.AppliedChange!.Describe()} → FAILED (do not retry)"
+                : $"  {i.AppliedChange!.Describe()} → score={i.Result.CompositeScore:F3} ({(i.IsBestSoFar ? "★ best" : i.Result.CompositeScore >= baselineScore ? "ok" : "worse")})")
             .ToList();
 
         string moeParam = isMoe
@@ -255,7 +290,7 @@ Respond with ONLY this JSON (no markdown, no extra text before or after):
 You are a llama.cpp performance optimizer. After {{triedSummary.Count}} attempts, the last 3 iterations produced no improvement.
 
 HARDWARE:
-- GPU: {{(hardware.HasGpu ? $"{hardware.Gpus.FirstOrDefault()?.Name ?? "GPU"} — {hardware.TotalVramMb} MB total, {hardware.FreeVramMb} MB free" : "none (CPU-only)")}}
+- GPU: {{(hardware.HasGpu ? $"{hardware.Gpus.FirstOrDefault()?.Name ?? "GPU"} — {hardware.TotalVramMb} MB total, {hardware.FreeVramMb} MB free (measured with the current model loaded — this is real remaining headroom)" : "none (CPU-only)")}}
 - RAM: {{hardware.RamTotalMb}} MB total, {{hardware.RamFreeMb}} MB free
 - CPU: {{hardware.CpuName}} — {{hardware.CpuCores}} cores / {{hardware.CpuThreads}} threads
 
@@ -270,7 +305,7 @@ BEST SETTINGS (score={{best.CompositeScore:F3}} vs baseline={{baselineScore:F3}}
 - threads: {{bestSettings.Threads}} / mmap: {{bestSettings.Mmap}} / mlock: {{bestSettings.Mlock}}
 - repeat-penalty: {{bestSettings.RepeatPenalty?.ToString() ?? "server default"}} / repeat-last-n: {{bestSettings.RepeatLastN?.ToString() ?? "server default"}} / dry-multiplier: {{bestSettings.DryMultiplier?.ToString() ?? "server default"}}
 
-ALREADY TRIED:
+ALREADY TRIED (do NOT repeat any of these parameter=value pairs — recreating an already-benchmarked configuration will be rejected):
 {{string.Join("\n", triedSummary)}}
 
 TARGET: {{session.TargetTgSpeed:F0}}t/s generation speed. Current TG is {{best.GenerationRate:F0}}t/s.
@@ -284,7 +319,7 @@ We need a fresh approach. Think carefully about:
 - Whether a completely different GPU layer count might hit a sweet spot
 - Toggling mmap on/off — hasn't necessarily been tried yet and can meaningfully shift TG speed
 - Context sizes not yet tried, in +16,384 steps (larger if VRAM permits, up to 131072)
-- Combinations we haven't explored (e.g. flash-attn + smaller ubatch)
+- Combinations we haven't explored (e.g. flash-attn + smaller ubatch) — you may change TWO parameters at once via the optional "parameter2"/"value2" fields
 - KV cache quantization levels not yet tried (this is a speed/VRAM lever, not a quality one — don't suggest it purely for quality)
 - Thread count tuning for CPU-bound operations
 - Mlock if the model fits in RAM
@@ -294,8 +329,8 @@ We need a fresh approach. Think carefully about:
 If you genuinely believe no further optimization is possible given what has been tried and the hardware constraints, respond with exactly:
 DONE
 
-Otherwise respond with ONLY this JSON (no markdown, no extra text):
-{"parameter":"<name>","value":<value>,"reasoning":"<specific reason this new angle is worth trying>"}
+Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/"value2" are optional — include them only to combine two complementary changes):
+{"parameter":"<name>","value":<value>,"parameter2":"<name>","value2":<value>,"reasoning":"<specific reason this new angle is worth trying>"}
 """;
     }
 
@@ -315,13 +350,39 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
             var (oldVal, newVal) = ApplyToSettings(current.Clone(), suggestion.Parameter, suggestion.Value);
             if (newVal is null) return null;
 
-            return new ParameterChange
+            var primary = new ParameterChange
             {
                 Parameter = suggestion.Parameter,
                 OldValue = oldVal,
                 NewValue = newVal,
                 Reasoning = suggestion.Reasoning,
                 Source = "llm",
+            };
+
+            // Optional second change: validate against the settings as they'd be after the
+            // first, so a repeated parameter or a no-op second value is silently dropped.
+            if (string.IsNullOrEmpty(suggestion.Parameter2) || suggestion.Value2 is null)
+                return primary;
+
+            var afterFirst = Apply(current, primary);
+            var (oldVal2, newVal2) = ApplyToSettings(afterFirst, suggestion.Parameter2, suggestion.Value2.Value);
+            if (newVal2 is null) return primary;
+
+            return new ParameterChange
+            {
+                Parameter = primary.Parameter,
+                OldValue = primary.OldValue,
+                NewValue = primary.NewValue,
+                Reasoning = primary.Reasoning,
+                Source = "llm",
+                Combined = new ParameterChange
+                {
+                    Parameter = suggestion.Parameter2,
+                    OldValue = oldVal2,
+                    NewValue = newVal2,
+                    Reasoning = suggestion.Reasoning,
+                    Source = "llm",
+                },
             };
         }
         catch
@@ -443,10 +504,26 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
         OptimizationProfile profile,
         HardwareInfo hardware)
     {
+        var change = GetHeuristicCandidate(session, profile, hardware);
+        if (change is not null && RecreatesTestedConfig(session, change))
+        {
+            logger.LogInformation(
+                "Heuristic suggestion {Param} = {Val} recreates an already-benchmarked configuration — nothing new to try",
+                change.Parameter, change.NewValue);
+            return null;
+        }
+        return change;
+    }
+
+    private ParameterChange? GetHeuristicCandidate(
+        OptimizationSession session,
+        OptimizationProfile profile,
+        HardwareInfo hardware)
+    {
         // Parameters tried so far (by name — for single-shot explorations)
         var tried = session.Iterations
             .Where(i => i.AppliedChange is not null)
-            .Select(i => i.AppliedChange!.Parameter)
+            .SelectMany(i => i.AppliedChange!.ParameterNames())
             .ToHashSet();
 
         var best = session.BestResult!;
@@ -458,7 +535,7 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
         // A near-zero quality score is the signature of a degenerate repetition loop
         // ("is is is is..."). Fix that before chasing any further speed gains — an
         // unusable response is worse than a faster one.
-        if (best.QualityScore < 0.3)
+        if (best.QualityScore < OptimizationSession.MinHealthyQuality)
         {
             if (!tried.Contains("RepeatPenalty") && bestSettings.RepeatPenalty is null or <= 1.0f)
                 return Change("RepeatPenalty", bestSettings.RepeatPenalty?.ToString() ?? "server default", 1.1f,
@@ -474,8 +551,8 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
         }
 
         // User-configurable per run (see OptimizationSession.TargetTgSpeed); shared with
-        // OptimizationSession.Best, which anchors future suggestions off the latest config
-        // that still clears this bar rather than the highest composite score.
+        // OptimizationSession.Best, which anchors future suggestions off the most capable
+        // config that still clears this bar rather than the highest composite score.
         double targetTgSpeed = session.TargetTgSpeed;
         double tgHeadroom = best.GenerationRate - targetTgSpeed;
         bool aboveSpeedTarget = tgHeadroom >= 0;
@@ -489,8 +566,8 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
         {
             if (lotsOfSpeedHeadroom && isMoe && bestSettings.MoeExpertUsed.HasValue)
             {
-                bool alreadyRestoredDefault = session.Iterations.Any(i =>
-                    i.AppliedChange?.Parameter == "MoeExpertUsed" && i.AppliedChange.NewValue is null);
+                bool alreadyRestoredDefault = AppliedChanges(session).Any(c =>
+                    c.Parameter == "MoeExpertUsed" && c.NewValue is null);
                 if (!alreadyRestoredDefault)
                     return Change("MoeExpertUsed", bestSettings.MoeExpertUsed.Value, null!,
                         $"TG={best.GenerationRate:F0}t/s is well above the {targetTgSpeed:F0}t/s target — " +
@@ -556,10 +633,10 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
         if (isMoe && tried.Contains("MoeExpertUsed") && bestSettings.MoeExpertUsed is > 2)
         {
             int nextExperts = Math.Max(1, bestSettings.MoeExpertUsed.Value - 2);
-            bool alreadyTried = session.Iterations.Any(i =>
-                i.AppliedChange?.Parameter == "MoeExpertUsed" &&
-                i.AppliedChange.NewValue is not null &&
-                Convert.ToInt32(i.AppliedChange.NewValue) == nextExperts);
+            bool alreadyTried = AppliedChanges(session).Any(c =>
+                c.Parameter == "MoeExpertUsed" &&
+                c.NewValue is not null &&
+                Convert.ToInt32(c.NewValue) == nextExperts);
             if (!alreadyTried)
                 return Change("MoeExpertUsed", bestSettings.MoeExpertUsed.Value, nextExperts,
                     "Reducing active experts further — the first reduction improved the score");
@@ -621,21 +698,34 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
         int nextCtx = Math.Min(bestSettings.ContextSize + ContextStep, ContextCeiling);
         if (nextCtx <= bestSettings.ContextSize) return null;
 
-        bool alreadyTried = session.Iterations.Any(i =>
-            i.AppliedChange?.Parameter == "ContextSize" &&
-            i.AppliedChange.NewValue is not null &&
-            Convert.ToInt32(i.AppliedChange.NewValue) == nextCtx);
+        bool alreadyTried = AppliedChanges(session).Any(c =>
+            c.Parameter == "ContextSize" &&
+            c.NewValue is not null &&
+            Convert.ToInt32(c.NewValue) == nextCtx);
 
         return alreadyTried ? null : nextCtx;
     }
 
+    // Every individual parameter change applied this session, with combined changes flattened.
+    private static IEnumerable<ParameterChange> AppliedChanges(OptimizationSession session) =>
+        session.Iterations
+            .Where(i => i.AppliedChange is not null)
+            .SelectMany(i => i.AppliedChange!.Chain());
+
     private static ParameterChange Change(string param, object oldVal, object newVal, string reason)
         => new() { Parameter = param, OldValue = oldVal, NewValue = newVal, Reasoning = reason, Source = "heuristic" };
 
-    /// <summary>Applies a ParameterChange to a cloned copy of the settings.</summary>
+    /// <summary>Applies a ParameterChange (and any combined changes) to a cloned copy of the settings.</summary>
     public static LlamaSettings Apply(LlamaSettings settings, ParameterChange change)
     {
         var s = settings.Clone();
+        foreach (var c in change.Chain())
+            ApplyInPlace(s, c);
+        return s;
+    }
+
+    private static void ApplyInPlace(LlamaSettings s, ParameterChange change)
+    {
         switch (change.Parameter)
         {
             case "GpuLayers":       s.GpuLayers = Convert.ToInt32(change.NewValue); break;
@@ -654,6 +744,5 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
             case "RepeatLastN":     s.RepeatLastN = change.NewValue is null ? null : Convert.ToInt32(change.NewValue); break;
             case "DryMultiplier":   s.DryMultiplier = change.NewValue is null ? null : Convert.ToSingle(change.NewValue); break;
         }
-        return s;
     }
 }

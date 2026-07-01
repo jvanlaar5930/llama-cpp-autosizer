@@ -19,6 +19,23 @@ public class ToolDefinition
     public object Parameters { get; set; } = new { type = "object", properties = new { } };
 }
 
+public class ToolBenchmarkCase
+{
+    public string Prompt { get; set; } = "";
+    // Tool names that count as the correct choice for this prompt; empty = any tool call.
+    public string[] ExpectedTools { get; set; } = [];
+}
+
+// A short prompt with an objectively checkable answer. Degraded configs (aggressive KV
+// cache quantization, too few MoE experts) stay fluent but start getting these wrong,
+// which is exactly the signal the speed-oriented metrics can't see.
+public class AccuracyPrompt
+{
+    public string Prompt { get; set; } = "";
+    // Response is correct if it contains ANY of these (case-insensitive substring match).
+    public string[] AcceptableAnswers { get; set; } = [];
+}
+
 public record class OptimizationProfile
 {
     public ProfileType Type { get; init; }
@@ -34,7 +51,8 @@ public record class OptimizationProfile
     public List<string> WarmupPrompts { get; init; } = [];
     public List<string> BenchmarkPrompts { get; init; } = [];
     public List<ToolDefinition> ToolDefinitions { get; init; } = [];
-    public List<string> ToolBenchmarkPrompts { get; init; } = [];
+    public List<ToolBenchmarkCase> ToolBenchmarks { get; init; } = [];
+    public List<AccuracyPrompt> AccuracyPrompts { get; init; } = [];
 
     // Opt-in long-form generation used to surface degenerate repetition loops
     // ("is is is is...") that short benchmark prompts rarely run long enough to reach.
@@ -71,6 +89,7 @@ public record class OptimizationProfile
             "User: Teach me something about nature.\nAssistant: Nature has so many fascinating systems. Want something about weather, ecosystems, or geology?\nUser: Describe the water cycle in 3–4 sentences.",
             "User: Can you write me some poetry?\nAssistant: I'd love to. Any particular form or subject in mind?\nUser: Write a haiku about autumn leaves.",
         ],
+        AccuracyPrompts = DefaultAccuracyPrompts(),
     };
 
     public static OptimizationProfile Agentic() => new()
@@ -167,13 +186,52 @@ public record class OptimizationProfile
                 }
             },
         ],
-        ToolBenchmarkPrompts =
+        ToolBenchmarks =
         [
-            "Search the web for the current weather in Paris and tell me what you found.",
-            "Read the file at /etc/hosts and summarize its contents.",
-            "Search for how to reverse a linked list in Python, then run a quick example.",
+            new()
+            {
+                Prompt = "Search the web for the current weather in Paris and tell me what you found.",
+                ExpectedTools = ["search_web"],
+            },
+            new()
+            {
+                Prompt = "Read the file at /etc/hosts and summarize its contents.",
+                ExpectedTools = ["read_file"],
+            },
+            new()
+            {
+                Prompt = "Search for how to reverse a linked list in Python, then run a quick example.",
+                ExpectedTools = ["search_web", "run_code"],
+            },
         ],
+        AccuracyPrompts = DefaultAccuracyPrompts(),
     };
+
+    // Easy enough that any healthy config answers all of them; a config degraded by
+    // aggressive KV quantization or expert reduction starts missing them first.
+    private static List<AccuracyPrompt> DefaultAccuracyPrompts() =>
+    [
+        new()
+        {
+            Prompt = "What is 17 multiplied by 23? Reply with only the number.",
+            AcceptableAnswers = ["391"],
+        },
+        new()
+        {
+            Prompt = "What is the capital city of Australia? Reply with only the city name.",
+            AcceptableAnswers = ["Canberra"],
+        },
+        new()
+        {
+            Prompt = "Which number is larger: 0.9 or 0.11? Reply with only that number.",
+            AcceptableAnswers = ["0.9"],
+        },
+        new()
+        {
+            Prompt = "Complete the sequence and reply with only the next number: 2, 4, 8, 16, ...",
+            AcceptableAnswers = ["32"],
+        },
+    ];
 
     // -------------------------------------------------------------------------
     // Scoring
