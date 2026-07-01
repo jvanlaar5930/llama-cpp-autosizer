@@ -144,6 +144,7 @@ public class ProfileMenu(
 
         var stopCts = new CancellationTokenSource();
         bool showFullLog = false;
+        bool showCommand = false;
         _ = Task.Run(() =>
         {
             while (!stopCts.IsCancellationRequested)
@@ -152,8 +153,16 @@ public class ProfileMenu(
                 {
                     var key = Console.ReadKey(intercept: true);
                     if (key.Key == ConsoleKey.L)
+                    {
                         showFullLog = !showFullLog;
-                    else
+                        showCommand = false;
+                    }
+                    else if (key.Key == ConsoleKey.P)
+                    {
+                        showCommand = !showCommand;
+                        showFullLog = false;
+                    }
+                    else if (key.Key == ConsoleKey.Escape)
                         stopCts.Cancel();
                 }
                 else
@@ -175,7 +184,7 @@ public class ProfileMenu(
         var prevMetricsSample = DateTime.UtcNow;
         double? liveTokPerSec = null;
 
-        await AnsiConsole.Live(BuildRunningPanel(profile, null, null, [], false, null))
+        await AnsiConsole.Live(BuildRunningPanel(profile, serverExecutable, null, null, [], false, false, null))
             .AutoClear(false)
             .Overflow(VerticalOverflow.Crop)
             .StartAsync(async ctx =>
@@ -237,7 +246,7 @@ public class ProfileMenu(
                         prevMetricsSample = now;
                     }
 
-                    ctx.UpdateTarget(BuildRunningPanel(profile, procStats, gpuStats, [.. logLines], showFullLog, liveTokPerSec));
+                    ctx.UpdateTarget(BuildRunningPanel(profile, serverExecutable, procStats, gpuStats, [.. logLines], showFullLog, showCommand, liveTokPerSec));
 
                     try { await Task.Delay(1000, stopCts.Token); }
                     catch (TaskCanceledException) { break; }
@@ -252,122 +261,153 @@ public class ProfileMenu(
         await Task.Delay(600, CancellationToken.None);
     }
 
+    // Wraps the active view (summary / full-log / command) with a sticky shortcut bar
+    // that remains visible when switching between views.
     private static IRenderable BuildRunningPanel(
         SavedProfile profile,
+        string serverExecutable,
         (double CpuPct, double RamGb)? proc,
         (int GpuPct, long UsedMb, long TotalMb)? gpu,
         string[] logs,
         bool showFullLog,
+        bool showCommand,
         double? liveTokPerSec)
     {
-        if (showFullLog)
-            return BuildFullLogPanel(logs, liveTokPerSec);
+        string lLabel = showFullLog ? "[bold green][[L]][/] [green]logs ◀[/]" : "[grey dim][[L]][/] [grey]logs[/]";
+        string pLabel = showCommand ? "[bold green][[P]][/] [green]command ◀[/]" : "[grey dim][[P]][/] [grey]command[/]";
+        var shortcuts = new Markup($"  {lLabel}   {pLabel}   [grey dim][[Esc]][/] [grey]stop server[/]");
 
+        IRenderable body = showCommand
+            ? BuildCommandPanel(profile, serverExecutable, liveTokPerSec)
+            : showFullLog
+                ? BuildFullLogPanel(logs, liveTokPerSec)
+                : BuildSummaryPanel(profile, proc, gpu, liveTokPerSec);
 
+        return new Rows(shortcuts, body);
+    }
+
+    private static IRenderable BuildSummaryPanel(
+        SavedProfile profile,
+        (double CpuPct, double RamGb)? proc,
+        (int GpuPct, long UsedMb, long TotalMb)? gpu,
+        double? liveTokPerSec)
+    {
         var s = profile.Settings;
-        bool isMoe = s.MoeExpertUsed.HasValue;
-        bool isThinking = s.ThinkingEnabled.HasValue;
 
-        var info = new Table().Border(TableBorder.None).HideHeaders()
+        // LEFT column: live stats
+        var left = new Table().Border(TableBorder.None).HideHeaders()
             .AddColumn(new TableColumn("").NoWrap())
             .AddColumn("");
 
-        info.AddRow("[grey]Model[/]",    $"[cyan]{Markup.Escape(profile.ModelName)}[/]");
-        info.AddRow("[grey]Profile[/]",  $"[cyan]{Markup.Escape(profile.Name)}[/]");
-        info.AddRow("[grey]Endpoints[/]", "[bold]http://127.0.0.1:8080/v1[/]  [grey]/health  /metrics[/]");
-        info.AddRow("", "");
-
-        // All settings (mirrors llama-server command exactly)
-        info.AddRow("[grey]ctx-size[/]",      $"[cyan]{s.ContextSize:N0}[/] tokens");
-        info.AddRow("[grey]n-gpu-layers[/]",   $"[cyan]{(s.GpuLayers == -1 ? "all" : s.GpuLayers)}[/]");
-        info.AddRow("[grey]batch-size[/]",     $"[cyan]{s.BatchSize}[/]");
-        info.AddRow("[grey]ubatch-size[/]",    $"[cyan]{s.UBatchSize}[/]");
-        info.AddRow("[grey]parallel[/]",       $"[cyan]{s.ParallelSlots}[/]");
-        info.AddRow("[grey]threads[/]",        $"[cyan]{(s.Threads < 0 ? "auto" : s.Threads)}[/]");
-        info.AddRow("[grey]threads-batch[/]",  $"[cyan]{(s.ThreadsBatch < 0 ? "auto" : s.ThreadsBatch)}[/]");
-        info.AddRow("[grey]flash-attn[/]",     s.FlashAttention ? "[green]yes[/]" : "no");
-        info.AddRow("[grey]mmap[/]",           s.Mmap ? "yes" : "[yellow]no (--no-mmap)[/]");
-        info.AddRow("[grey]mlock[/]",          s.Mlock ? "[yellow]yes[/]" : "no");
-        info.AddRow("[grey]cache-type-k[/]",   $"[cyan]{s.CacheTypeK ?? "f16"}[/]");
-        info.AddRow("[grey]cache-type-v[/]",   $"[cyan]{s.CacheTypeV ?? "f16"}[/]");
-        if (isMoe)
-            info.AddRow("[grey]experts (MoE)[/]", $"[cyan]{s.MoeExpertUsed!.Value}[/]");
-        if (isThinking)
-        {
-            string tv = s.ThinkingEnabled switch { true => "[green]enabled[/]", false => "[grey]disabled[/]", _ => "model default" };
-            info.AddRow("[grey]thinking[/]", tv);
-        }
-        if (!string.IsNullOrWhiteSpace(s.ExtraArgs))
-            info.AddRow("[grey]extra-args[/]", $"[yellow]{Markup.Escape(s.ExtraArgs)}[/]");
-
         if (profile.BenchmarkTgRate.HasValue)
         {
-            info.AddRow("", "");
-            info.AddRow("[grey]Benchmark TG[/]",   $"[green]~{profile.BenchmarkTgRate:F0} t/s[/]");
-            info.AddRow("[grey]Benchmark PP[/]",   $"[green]~{profile.BenchmarkPpRate:F0} t/s[/]");
-            info.AddRow("[grey]Benchmark TTFT[/]", $"[green]~{profile.BenchmarkTtftMs:F0} ms[/]");
+            left.AddRow("[grey]Bench TG (peak)[/]",   $"[green]~{profile.BenchmarkTgRate:F0} t/s[/]");
+            left.AddRow("[grey]Bench PP (peak)[/]",   $"[green]~{profile.BenchmarkPpRate:F0} t/s[/]");
+            left.AddRow("[grey]Bench TTFT[/]",        $"[green]~{profile.BenchmarkTtftMs:F0} ms[/]");
+            left.AddRow("", "");
         }
 
-        // Real-time stats
-        info.AddRow("", "");
         if (proc.HasValue)
         {
-            info.AddRow("[grey]CPU  (server)[/]", FormatPct(proc.Value.CpuPct));
-            info.AddRow("[grey]RAM  (server)[/]", $"[cyan]{proc.Value.RamGb:F2} GB[/]");
+            left.AddRow("[grey]CPU  (server)[/]", FormatPct(proc.Value.CpuPct));
+            left.AddRow("[grey]RAM  (server)[/]", $"[cyan]{proc.Value.RamGb:F2} GB[/]");
         }
         else
         {
-            info.AddRow("[grey]CPU  (server)[/]", "[dim]sampling...[/]");
-            info.AddRow("[grey]RAM  (server)[/]", "[dim]sampling...[/]");
+            left.AddRow("[grey]CPU  (server)[/]", "[dim]sampling...[/]");
+            left.AddRow("[grey]RAM  (server)[/]", "[dim]sampling...[/]");
         }
         if (gpu.HasValue)
         {
-            info.AddRow("[grey]GPU[/]", FormatPct(gpu.Value.GpuPct));
-            info.AddRow("[grey]VRAM[/]", $"[cyan]{gpu.Value.UsedMb / 1024.0:F1} / {gpu.Value.TotalMb / 1024.0:F1} GB[/]");
+            left.AddRow("[grey]GPU[/]",  FormatPct(gpu.Value.GpuPct));
+            left.AddRow("[grey]VRAM[/]", $"[cyan]{gpu.Value.UsedMb / 1024.0:F1} / {gpu.Value.TotalMb / 1024.0:F1} GB[/]");
         }
-        info.AddRow("[grey]Live TG[/]", liveTokPerSec.HasValue
-            ? $"[green]{liveTokPerSec.Value:F1} t/s[/]"
+        left.AddRow("", "");
+        left.AddRow("[grey]Live TG[/]", liveTokPerSec.HasValue
+            ? $"[bold green]{liveTokPerSec.Value:F1} t/s[/]"
             : "[dim]idle[/]");
 
+        // RIGHT column: connection + all settings
+        var right = new Table().Border(TableBorder.None).HideHeaders()
+            .AddColumn(new TableColumn("").NoWrap())
+            .AddColumn("");
+
+        right.AddRow("[grey]api-name[/]",  $"[cyan]{Markup.Escape(profile.ModelName)}[/]");
+        right.AddRow("[grey]endpoint[/]",  "[bold]http://127.0.0.1:8080[/][grey]/v1  /health  /metrics[/]");
+        right.AddRow("", "");
+        right.AddRow("[grey]ctx-size[/]",          $"[cyan]{s.ContextSize:N0}[/] [grey]tokens[/]");
+        right.AddRow("[grey]n-gpu-layers[/]",       $"[cyan]{(s.GpuLayers == -1 ? "all" : s.GpuLayers)}[/]");
+        right.AddRow("[grey]batch / ubatch[/]",     $"[cyan]{s.BatchSize}[/] / [cyan]{s.UBatchSize}[/]");
+        right.AddRow("[grey]parallel[/]",           $"[cyan]{s.ParallelSlots}[/]");
+        right.AddRow("[grey]threads / t-batch[/]",  $"[cyan]{(s.Threads < 0 ? "auto" : s.Threads)}[/] / [cyan]{(s.ThreadsBatch < 0 ? "auto" : s.ThreadsBatch)}[/]");
+        right.AddRow("[grey]flash-attn[/]",         s.FlashAttention ? "[green]yes[/]" : "no");
+        right.AddRow("[grey]mmap[/]",               s.Mmap ? "yes" : "[yellow]no[/]");
+        right.AddRow("[grey]mlock[/]",              s.Mlock ? "[yellow]yes[/]" : "no");
+        right.AddRow("[grey]cache-type-k[/]",       $"[cyan]{s.CacheTypeK ?? "f16"}[/]");
+        right.AddRow("[grey]cache-type-v[/]",       $"[cyan]{s.CacheTypeV ?? "f16"}[/]");
+        if (s.MoeExpertUsed.HasValue)
+            right.AddRow("[grey]experts (MoE)[/]", $"[cyan]{s.MoeExpertUsed.Value}[/]");
+        if (s.ThinkingEnabled.HasValue)
+        {
+            string tv = s.ThinkingEnabled switch { true => "[green]enabled[/]", false => "[grey]disabled[/]", _ => "model default" };
+            right.AddRow("[grey]thinking[/]", tv);
+        }
+        if (!string.IsNullOrWhiteSpace(s.ExtraArgs))
+            right.AddRow("[grey]extra-args[/]", $"[yellow]{Markup.Escape(s.ExtraArgs)}[/]");
         if (!string.IsNullOrWhiteSpace(profile.Notes))
         {
-            info.AddRow("", "");
-            info.AddRow("[grey]Notes[/]", $"[italic]{Markup.Escape(profile.Notes)}[/]");
+            right.AddRow("", "");
+            right.AddRow("[grey]notes[/]", $"[italic]{Markup.Escape(profile.Notes)}[/]");
         }
 
-        List<IRenderable> parts = [new Padder(info, new Padding(1, 0))];
+        var twoCol = new Table()
+            .Border(TableBorder.None)
+            .HideHeaders()
+            .AddColumn(new TableColumn("").Padding(1, 0))
+            .AddColumn(new TableColumn("").Padding(1, 0));
+        twoCol.AddRow(left, right);
 
-        // Keep the panel within the console window — Spectre's Live display doesn't
-        // overwrite cleanly when a frame is taller than the terminal, which produces
-        // a runaway stack of duplicated, truncated panels instead of one in-place update.
-        const int MaxTailLogLines = 8;
-        const int ChromeRows = 4; // top+bottom border, plus safety margin for cursor drift
-        int available = Math.Max(0, Console.WindowHeight - info.Rows.Count - ChromeRows);
-        int tailLogLines = logs.Length > 0 ? Math.Clamp(available - 1, 0, MaxTailLogLines) : 0;
-
-        if (tailLogLines > 0)
+        return new Panel(twoCol)
         {
-            parts.Add(new Rule("[grey dim]logs[/]").RuleStyle("grey dim"));
-            foreach (var line in logs.Skip(Math.Max(0, logs.Length - tailLogLines)))
-                parts.Add(new Text(line));
-        }
-
-        var panel = new Panel(new Rows(parts))
-        {
-            Header = new PanelHeader("[bold green] Server Running [/]  [grey]L = full logs   any other key = stop[/]"),
+            Header = new PanelHeader($"[bold green] {Markup.Escape(profile.Name)} [/]"),
             Border = BoxBorder.Double,
             Padding = new Padding(0, 0),
         };
+    }
 
-        return panel;
+    private static IRenderable BuildCommandPanel(
+        SavedProfile profile, string serverExecutable, double? liveTokPerSec)
+    {
+        string cmd = $"{serverExecutable} {string.Join(" ", profile.Settings.ToServerArgs(profile.ModelPath))}";
+
+        var rows = new List<IRenderable>
+        {
+            new Markup("[grey]Run in any terminal to start this configuration:[/]"),
+            new Rule().RuleStyle("grey dim"),
+            new Panel(new Text(cmd, new Style(Color.LightGreen)))
+            {
+                Border = BoxBorder.Rounded,
+                Padding = new Padding(1, 0),
+            },
+            new Rule().RuleStyle("grey dim"),
+            new Markup($"[grey]API endpoint:[/]   [bold]http://127.0.0.1:8080/v1[/]"),
+            new Markup($"[grey]Model name:[/]     [cyan]{Markup.Escape(profile.ModelName)}[/]"),
+            new Markup($"[grey]Live TG:[/]        {(liveTokPerSec.HasValue ? $"[bold green]{liveTokPerSec.Value:F1} t/s[/]" : "[dim]idle[/]")}"),
+        };
+
+        return new Panel(new Rows(rows))
+        {
+            Header = new PanelHeader($"[bold green] {Markup.Escape(profile.Name)} — Command [/]"),
+            Border = BoxBorder.Double,
+            Padding = new Padding(1, 0),
+        };
     }
 
     private static IRenderable BuildFullLogPanel(string[] logs, double? liveTokPerSec)
     {
-        // Chrome: top+bottom border (2), live-gen line + rule (2), plus safety margin
-        // for cursor drift — Live's relative redraw breaks if a frame forces the
-        // terminal to scroll, so we deliberately stay a few lines under the window.
-        int height = Math.Max(3, Console.WindowHeight - 9);
+        // Stay a few lines under the window height to avoid cursor-drift on redraws.
+        // Shortcut bar (1 line) + panel borders (2) + live-gen line + rule (2) + margin (4)
+        int height = Math.Max(3, Console.WindowHeight - 10);
         var tail = logs.Skip(Math.Max(0, logs.Length - height)).ToList();
 
         var rows = new List<IRenderable>
@@ -382,14 +422,12 @@ public class ProfileMenu(
         if (tail.Count == 0)
             rows.Add(new Text("[waiting for output...]", new Style(Color.Grey)));
 
-        var panel = new Panel(new Rows(rows))
+        return new Panel(new Rows(rows))
         {
-            Header = new PanelHeader("[bold green] Server Running — Full Log [/]  [grey]L = back to summary   any other key = stop[/]"),
+            Header = new PanelHeader("[bold green] Full Log [/]"),
             Border = BoxBorder.Double,
             Padding = new Padding(0, 0),
         };
-
-        return panel;
     }
 
     private static string FormatPct(double pct)

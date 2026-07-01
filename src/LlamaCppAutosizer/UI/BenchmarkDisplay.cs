@@ -176,15 +176,15 @@ public static class BenchmarkDisplay
         AnsiConsole.MarkupLine("[grey]Select which settings to use:[/]");
         AnsiConsole.WriteLine();
 
-        // Build display labels (no Markup inside SelectionPrompt labels — they're plain text)
+        // Build display labels — avoid [ ] since Spectre interprets them as markup tags
         var labels = stars.Select(i =>
         {
             string change = i.Number == 0 ? "baseline"
                 : i.AppliedChange is null ? "?"
-                : $"{i.AppliedChange.Parameter} → {i.AppliedChange.NewValue}";
+                : $"{i.AppliedChange.Parameter} = {i.AppliedChange.NewValue}";
             return $"Iter {i.Number,2}  score={i.Result.CompositeScore:F3}  " +
                    $"TG={i.Result.GenerationRate:F1}t/s  PP={i.Result.PromptProcessingRate:F1}t/s  " +
-                   $"ctx={i.Settings.ContextSize:N0}  [{change}]";
+                   $"ctx={i.Settings.ContextSize:N0}  ({change})";
         }).ToList();
 
         var picked = AnsiConsole.Prompt(

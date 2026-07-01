@@ -54,13 +54,15 @@ public record class OptimizationProfile
             "Hello!",
             "What is 2 + 2?",
         ],
+        // Each prompt includes a short prior-turn so TG is measured with a small amount
+        // of KV cache already populated, closer to real conversational use.
         BenchmarkPrompts =
         [
-            "Tell me a short story about a robot who learns to paint. Keep it under 150 words.",
-            "Explain the concept of recursion in programming with a brief, clear example.",
-            "What are three practical tips for improving sleep quality?",
-            "Describe the water cycle in 3–4 sentences.",
-            "Write a haiku about autumn leaves.",
+            "User: Can you help me learn something new today?\nAssistant: Of course! What topic interests you — science, history, coding, or something else?\nUser: Tell me a short story about a robot who learns to paint. Keep it under 150 words.",
+            "User: I'm brushing up on programming concepts.\nAssistant: Great — happy to help. Where would you like to start?\nUser: Explain the concept of recursion in programming with a brief, clear example.",
+            "User: Give me some life advice.\nAssistant: Happy to share some practical wisdom. What area — health, productivity, or relationships?\nUser: What are three practical tips for improving sleep quality?",
+            "User: Teach me something about nature.\nAssistant: Nature has so many fascinating systems. Want something about weather, ecosystems, or geology?\nUser: Describe the water cycle in 3–4 sentences.",
+            "User: Can you write me some poetry?\nAssistant: I'd love to. Any particular form or subject in mind?\nUser: Write a haiku about autumn leaves.",
         ],
     };
 
@@ -77,11 +79,40 @@ public record class OptimizationProfile
         [
             "List any tools you have available.",
         ],
+        // Prompts include a realistic multi-turn conversation preamble so that TG is
+        // measured with a partially-filled KV cache, matching real agentic workloads.
         BenchmarkPrompts =
         [
-            "Analyze this Python snippet and identify any issues:\n\ndef fib(n):\n    if n == 0: return 0\n    return fib(n-1) + fib(n-2)\n\nBe concise.",
-            "Break down a software release plan into 5 ordered steps. Be specific and concise.",
-            "Given a list of tasks: [email clients, update docs, fix bug #42, review PR]. Prioritize them by urgency and explain briefly.",
+            // Preamble: ~400-token coding-agent conversation, then the actual task
+            "You are an expert AI coding assistant. Here is the conversation so far:\n\n" +
+            "<USER>: I have a FastAPI app with SQLAlchemy and PostgreSQL. The report endpoint takes 30+ seconds.\n\n" +
+            "<ASSISTANT>: This is almost certainly an N+1 query problem. Each row you iterate triggers a new SELECT. Fix it with eager loading:\n" +
+            "```python\n# Bad\nfor order in orders:\n    items = order.items  # new query each time\n\n" +
+            "# Good\norders = session.query(Order).options(joinedload(Order.items)).all()\n```\n" +
+            "Can you share the endpoint code so I can give specific advice?\n\n" +
+            "<USER>: Here it is:\n```python\nasync def generate_report(db, user_id, date_from, date_to):\n" +
+            "    result = await db.execute(select(Order).where(Order.user_id == user_id))\n" +
+            "    orders = result.scalars().all()\n    report = []\n" +
+            "    for order in orders:\n        r = await db.execute(select(OrderItem).where(OrderItem.order_id == order.id))\n" +
+            "        items = r.scalars().all()\n        report.append({'id': order.id, 'total': sum(i.price * i.qty for i in items)})\n" +
+            "    return report\n```\n\n" +
+            "<ASSISTANT>: Classic N+1. Here is the optimized single-query version with joinedload and a date filter:\n\n" +
+            "Now add a composite index and a streaming fallback for large result sets. What database version are you on?\n\n" +
+            "<USER>: PostgreSQL 15. Now I need you to:\n" +
+            "1. Write the optimized query with proper eager loading and date filtering.\n" +
+            "2. Add a covering index migration.\n" +
+            "3. Explain why each change helps. Be thorough.",
+
+            "You are an expert AI coding assistant. Previous context:\n\n" +
+            "<USER>: Set up CI/CD for my Python monorepo with GitHub Actions.\n\n" +
+            "<ASSISTANT>: Here is a matrix strategy that runs lint, test, and build in parallel across Python 3.11 and 3.12:\n" +
+            "```yaml\njobs:\n  test:\n    strategy:\n      matrix:\n        python-version: ['3.11', '3.12']\n    steps:\n" +
+            "      - uses: actions/checkout@v4\n      - uses: actions/setup-python@v5\n        with:\n          python-version: ${{ matrix.python-version }}\n" +
+            "      - run: pip install -e '.[dev]'\n      - run: pytest --cov\n```\n\n" +
+            "<USER>: Add deployment to AWS ECS with blue/green and auto-rollback on failed health check.\n\n" +
+            "<ASSISTANT>: You need a separate deploy job gated on the test job, using the AWS CLI and ECS blue/green via CodeDeploy:\n\n" +
+            "The rollback trigger is a CloudWatch alarm on the ALB target group unhealthy host count. Let me write the full workflow.\n\n" +
+            "<USER>: Also add Dependabot config, branch protection rules via Terraform, and a release drafter. List every file you will create and what goes in each.",
         ],
         ToolDefinitions =
         [

@@ -221,7 +221,7 @@ Valid parameters and example values:
 - Mlock: true or false{{moeParam}}
 
 Respond with ONLY this JSON (no markdown, no extra text before or after):
-{"parameter":"<name>","value":<value>,"reasoning":"<one sentence explaining why this should help>"}
+{"parameter":"<name>","value":<value>,"reasoning":"<one hypothesis sentence: what you expect to happen and why — do not restate numbers from the history above>"}
 """;
     }
 
