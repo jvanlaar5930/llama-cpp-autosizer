@@ -363,6 +363,12 @@ public class MainMenu(
                     ? ValidationResult.Success()
                     : ValidationResult.Error("Must be 2–50")));
 
+        string userGuidance = AnsiConsole.Prompt(
+            new TextPrompt<string>(
+                "[grey]Any guidance for the optimizer, e.g. \"prioritize low VRAM usage\" or[/]\n" +
+                "[grey]\"favor large context over raw speed\" (empty to skip):[/]")
+                .AllowEmpty());
+
         var opts = new OptimizationOptions(MaxIterations: maxIter);
 
         // Single session shared with the optimizer — CompletionReason and iteration history
@@ -372,21 +378,26 @@ public class MainMenu(
             ModelPath = _modelPath,
             Profile = _profile.Type,
             Hardware = _hardware,   // optimizer will refresh this with a live DetectAsync
+            UserGuidance = string.IsNullOrWhiteSpace(userGuidance) ? null : userGuidance.Trim(),
         };
 
         AnsiConsole.Clear();
         AnsiConsole.Write(new Rule("[bold cyan]Running Optimization[/]").RuleStyle("cyan"));
         AnsiConsole.MarkupLine($"[grey]Model: {Markup.Escape(session.ModelName)}  Profile: {Markup.Escape(_profile.Name)}  Max iterations: {maxIter}[/]");
+        if (session.UserGuidance is not null)
+            AnsiConsole.MarkupLine($"[grey]Guidance:[/] [italic]{Markup.Escape(session.UserGuidance)}[/]");
         AnsiConsole.MarkupLine("[yellow]⚠ System may become slow or unresponsive during benchmarking — this is normal.[/]");
         AnsiConsole.MarkupLine("[grey]Press Ctrl+C to stop early and keep the best result found so far.[/]");
         AnsiConsole.WriteLine();
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
-        // Server log lines are printed as normal scrolling console output (so the user can
-        // scroll the terminal back through full history) with a small fixed-height footer
-        // (status/spinner + progress bar) redrawn in place below them via relative ANSI
-        // cursor movement — the same technique MenuHelper uses for its own redraws.
+        // Server log: in full mode, lines print as normal scrolling console output (so the
+        // user can scroll the terminal back through full history). In truncated mode, only
+        // the last few lines are shown, redrawn in place inside the footer. Either way the
+        // footer (status/spinner + progress bar) is redrawn in place below via relative ANSI
+        // cursor movement — the same technique MenuHelper uses for its own redraws. Press L
+        // to toggle between the two.
         var logQueue = new System.Collections.Concurrent.ConcurrentQueue<string>();
         llamaServer.SetLogHandler(logQueue.Enqueue);
 
@@ -394,26 +405,83 @@ public class MainMenu(
         var iterations = optimizer.OptimizeAsync(
             _serverExecutable, _modelPath, initialSettings, _profile, session, opts, cts.Token);
 
-        AnsiConsole.Write(new Rule("[grey dim]llama-server log (scroll up for history)[/]").RuleStyle("grey dim"));
+        AnsiConsole.Write(new Rule("[grey dim]llama-server log (scroll up for history) — L: toggle full/truncated[/]").RuleStyle("grey dim"));
 
         int footerLineCount = 0;
         int spinnerFrame = 0;
         int iterDone = 0;
+        bool showFullLog = true;
+        var allLogs = new List<string>();      // every log line ever received, never trimmed
+        int printedCount = 0;                   // how many of allLogs have hit the scrolling console
+        const int MaxTruncatedLines = 10;
+
+        // Background key watcher: only reacts to L (toggle log mode); everything else is
+        // ignored — Ctrl+C (handled separately via the cancellation token) remains the only
+        // way to stop early.
+        using var keyWatcherCts = new CancellationTokenSource();
+        _ = Task.Run(() =>
+        {
+            while (!keyWatcherCts.IsCancellationRequested)
+            {
+                if (Console.KeyAvailable)
+                {
+                    if (Console.ReadKey(intercept: true).Key == ConsoleKey.L)
+                        showFullLog = !showFullLog;
+                }
+                else
+                {
+                    Thread.Sleep(20);
+                }
+            }
+        });
 
         void DrainLogs()
         {
             while (logQueue.TryDequeue(out var line))
             {
                 if (!string.IsNullOrWhiteSpace(line))
-                    AnsiConsole.MarkupLine($"[grey]{Markup.Escape(line)}[/]");
+                    allLogs.Add(line);
+            }
+
+            // Full mode: flush everything not yet printed — including lines that arrived
+            // while truncated mode was active, so switching back to full catches up in full.
+            if (showFullLog)
+            {
+                for (int i = printedCount; i < allLogs.Count; i++)
+                    AnsiConsole.MarkupLine($"[grey]{Markup.Escape(allLogs[i])}[/]");
+                printedCount = allLogs.Count;
             }
         }
 
-        void RedrawFooter(IReadOnlyList<string> lines)
+        List<string> WithTruncatedLog(IReadOnlyList<string> statusLines)
+        {
+            if (showFullLog || allLogs.Count == 0) return [.. statusLines];
+
+            int width = Math.Max(40, Console.WindowWidth);
+            int innerWidth = Math.Max(10, width - 4);
+
+            string header = $" llama-server log (last {MaxTruncatedLines}) ";
+            int dashCount = Math.Max(0, width - header.Length - 3);
+
+            var lines = new List<string> { $"[white]╭─{header}{new string('─', dashCount)}╮[/]" };
+            foreach (var raw in allLogs.Skip(Math.Max(0, allLogs.Count - MaxTruncatedLines)))
+            {
+                string clipped = raw.Length > innerWidth ? raw[..innerWidth] : raw;
+                string padded = clipped.PadRight(innerWidth);
+                lines.Add($"[white]│[/] [grey]{Markup.Escape(padded)}[/] [white]│[/]");
+            }
+            lines.Add($"[white]╰{new string('─', width - 2)}╯[/]");
+
+            lines.AddRange(statusLines);
+            return lines;
+        }
+
+        void RedrawFooter(IReadOnlyList<string> statusLines)
         {
             if (footerLineCount > 0)
                 Console.Write($"\x1b[{footerLineCount}A\r\x1b[0J");
             DrainLogs();
+            var lines = WithTruncatedLog(statusLines);
             foreach (var line in lines)
                 AnsiConsole.MarkupLine(line);
             footerLineCount = lines.Count;
@@ -428,22 +496,31 @@ public class MainMenu(
             return $"{bar}  {pct:F0}%  ({iterDone}/{maxIter + 1})";
         }
 
-        await using (var enumerator = iterations.GetAsyncEnumerator(cts.Token))
+        // Last completed iteration's status — kept on screen (under the spinner) while the
+        // next one is being prepared, instead of being replaced by a bare spinner line.
+        string lastIterStatus = "";
+        string lastIterSub = "";
+
+        try
         {
+            await using var enumerator = iterations.GetAsyncEnumerator(cts.Token);
             var moveNextTask = enumerator.MoveNextAsync().AsTask();
 
             while (true)
             {
                 // While waiting for the next iteration (server start + benchmark can take a
                 // while, especially the first/baseline one), keep the footer alive: spin,
-                // and flush any server log lines as they scroll in.
+                // flush any server log lines as they scroll in, and keep showing what the
+                // last completed iteration found so that info doesn't just vanish.
                 while (!moveNextTask.IsCompleted)
                 {
                     string waitingLabel = iterDone == 0 ? "Preparing llama-server…" : "Working…";
-                    RedrawFooter([
-                        $"[yellow]{SpinnerFrames[spinnerFrame++ % SpinnerFrames.Length]} {waitingLabel}[/]",
-                        BuildProgressLine(),
-                    ]);
+                    var waitingLines = new List<string>();
+                    if (lastIterStatus.Length > 0) waitingLines.Add(lastIterStatus);
+                    if (lastIterSub.Length > 0) waitingLines.Add($"  [grey]{lastIterSub}[/]");
+                    waitingLines.Add($"[yellow]{SpinnerFrames[spinnerFrame++ % SpinnerFrames.Length]} {waitingLabel}[/]");
+                    waitingLines.Add(BuildProgressLine());
+                    RedrawFooter(waitingLines);
                     await Task.WhenAny(moveNextTask, Task.Delay(150, cts.Token));
                 }
 
@@ -452,22 +529,26 @@ public class MainMenu(
 
                 iterDone++;
                 string bestMark = iter.IsBestSoFar ? "  [bold green]★ best[/]" : "";
-                string iterStatus = $"[grey]iter {iter.Number}/{maxIter}[/]  " +
+                lastIterStatus = $"[grey]iter {iter.Number}/{maxIter}[/]  " +
                              $"score=[green]{iter.Result.CompositeScore:F3}[/]  " +
                              $"TG=[cyan]{iter.Result.GenerationRate:F1}t/s[/]  " +
                              $"PP=[cyan]{iter.Result.PromptProcessingRate:F0}t/s[/]" +
                              bestMark;
-                string iterSub = iter.StatusMessage is not null
+                lastIterSub = iter.StatusMessage is not null
                     ? Markup.Escape(iter.StatusMessage)
                     : "";
 
-                var footerLines = new List<string> { iterStatus };
-                if (!string.IsNullOrEmpty(iterSub)) footerLines.Add($"  [grey]{iterSub}[/]");
-                footerLines.Add(BuildProgressLine());
-                RedrawFooter(footerLines);
+                var statusLines = new List<string> { lastIterStatus };
+                if (!string.IsNullOrEmpty(lastIterSub)) statusLines.Add($"  [grey]{lastIterSub}[/]");
+                statusLines.Add(BuildProgressLine());
+                RedrawFooter(statusLines);
 
                 moveNextTask = enumerator.MoveNextAsync().AsTask();
             }
+        }
+        finally
+        {
+            keyWatcherCts.Cancel();
         }
 
         DrainLogs();

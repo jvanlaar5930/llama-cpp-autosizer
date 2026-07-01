@@ -40,6 +40,10 @@ public class OptimizationSession
     public bool IsComplete { get; set; }
     public string? CompletionReason { get; set; }
 
+    // Free-text steer from the user (e.g. "prioritize low VRAM usage"), passed to the
+    // LLM recommender's prompts. Null/empty means no extra guidance was given.
+    public string? UserGuidance { get; set; }
+
     // TurboQuant results if run
     public string? TurboQuantModelPath { get; set; }
     public BenchmarkResult? TurboQuantResult { get; set; }

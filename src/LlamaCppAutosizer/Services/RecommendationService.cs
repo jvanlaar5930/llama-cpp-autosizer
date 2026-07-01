@@ -173,6 +173,10 @@ public class RecommendationService(
             ? $"\n- MoeExpertUsed: integer, e.g. 4, 6, 8, 12 (fewer experts = less VRAM + faster; current={bestSettings.MoeExpertUsed?.ToString() ?? "model default"})"
             : "";
 
+        string guidance = string.IsNullOrWhiteSpace(session.UserGuidance)
+            ? ""
+            : $"\nUSER GUIDANCE (follow this even if it means a different tradeoff than the profile default): {session.UserGuidance}\n";
+
         return $$"""
 You are a llama.cpp performance optimizer. Your task is to find the best server settings for this model on this hardware by trying one change at a time.
 Study the results so far and suggest ONE parameter change most likely to improve the composite score.
@@ -184,6 +188,7 @@ HARDWARE:
 - CPU: {{hardware.CpuName}} — {{hardware.CpuCores}} cores / {{hardware.CpuThreads}} threads
 
 PROFILE: {{profile.Name}} — {{profile.Description}}{{moeContext}}
+{{guidance}}
 
 BEST SETTINGS SO FAR (score={{best.CompositeScore:F3}} | TG={{best.GenerationRate:F0}}t/s PP={{best.PromptProcessingRate:F0}}t/s TTFT={{best.TimeToFirstTokenMs:F0}}ms):
 - ctx-size: {{bestSettings.ContextSize}}
@@ -233,6 +238,10 @@ Respond with ONLY this JSON (no markdown, no extra text before or after):
             ? $"\n- MoeExpertUsed: integer (e.g. 4, 6, 8, 12) — fewer experts saves VRAM and increases speed"
             : "";
 
+        string guidance = string.IsNullOrWhiteSpace(session.UserGuidance)
+            ? ""
+            : $"\nUSER GUIDANCE (follow this even if it means a different tradeoff than the profile default): {session.UserGuidance}\n";
+
         return $$"""
 You are a llama.cpp performance optimizer. After {{triedSummary.Count}} attempts, the last 3 iterations produced no improvement.
 
@@ -242,7 +251,7 @@ HARDWARE:
 - CPU: {{hardware.CpuName}} — {{hardware.CpuCores}} cores / {{hardware.CpuThreads}} threads
 
 PROFILE: {{profile.Name}} — {{profile.Description}}
-
+{{guidance}}
 BEST SETTINGS (score={{best.CompositeScore:F3}} vs baseline={{baselineScore:F3}} | TG={{best.GenerationRate:F0}}t/s PP={{best.PromptProcessingRate:F0}}t/s TTFT={{best.TimeToFirstTokenMs:F0}}ms):
 - ctx-size: {{bestSettings.ContextSize}}
 - n-gpu-layers: {{bestSettings.GpuLayers}} (-1 = all layers)
