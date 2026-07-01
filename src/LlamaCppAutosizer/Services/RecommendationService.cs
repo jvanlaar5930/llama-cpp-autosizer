@@ -198,6 +198,7 @@ BEST SETTINGS SO FAR (score={{best.CompositeScore:F3}} | TG={{best.GenerationRat
 - cache-type-k: {{bestSettings.CacheTypeK ?? "f16"}} / cache-type-v: {{bestSettings.CacheTypeV ?? "f16"}}
 - threads: {{bestSettings.Threads}} (-1 = auto)
 - mmap: {{bestSettings.Mmap}} / mlock: {{bestSettings.Mlock}}
+- repeat-penalty: {{bestSettings.RepeatPenalty?.ToString() ?? "server default"}} / repeat-last-n: {{bestSettings.RepeatLastN?.ToString() ?? "server default"}} / dry-multiplier: {{bestSettings.DryMultiplier?.ToString() ?? "server default"}}
 
 FULL OPTIMIZATION HISTORY:
 {{string.Join("\n", historyLines)}}
@@ -206,6 +207,7 @@ GOAL: Target generation speed is {{session.TargetTgSpeed:F0}}t/s.
 - Below {{session.TargetTgSpeed:F0}}t/s: prioritize whatever raises TG speed most (GPU layers, flash-attn, mmap, KV cache quantization, batch size).
 - At or above {{session.TargetTgSpeed:F0}}t/s with only modest headroom: prefer growing ContextSize (in +16,384 steps) for more capability — it's free upside that doesn't cost the speed already banked.
 - Well above {{session.TargetTgSpeed:F0}}t/s (lots of headroom, e.g. {{session.TargetTgSpeed + LotsOfHeadroomAboveTarget:F0}}t/s+): it's fine to give back some speed for quality — e.g. restore MoE active-expert count toward the model default — as long as TG stays at/above {{session.TargetTgSpeed:F0}}t/s.
+- If the quality score has cratered on the current best (a strong sign of a degenerate repetition loop like "is is is is..."), prioritize RepeatPenalty (e.g. 1.1–1.3), RepeatLastN (e.g. 256), or DryMultiplier (e.g. 0.8) over speed tuning — an unusable output is worse than a faster one.
 RULE: If a parameter made things worse, try something else OR a different value for it. Never suggest changing cache-type-k/cache-type-v purely to "improve quality" — that's a speed/VRAM lever, not a quality one.
 
 Valid parameters and example values:
@@ -218,7 +220,10 @@ Valid parameters and example values:
 - CacheTypeV: "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"
 - Threads: -1 (auto), or 1–{{hardware.CpuThreads}}
 - Mmap: true or false (disabling forces the full model into RAM up front)
-- Mlock: true or false{{moeParam}}
+- Mlock: true or false
+- RepeatPenalty: 1.0 (off) to 1.5, e.g. 1.1
+- RepeatLastN: -1 (whole context), 0 (off), or a positive window size, e.g. 256
+- DryMultiplier: 0 (off) to 2.0, e.g. 0.8{{moeParam}}
 
 Respond with ONLY this JSON (no markdown, no extra text before or after):
 {"parameter":"<name>","value":<value>,"reasoning":"<one hypothesis sentence: what you expect to happen and why — do not restate numbers from the history above>"}
@@ -263,6 +268,7 @@ BEST SETTINGS (score={{best.CompositeScore:F3}} vs baseline={{baselineScore:F3}}
 - flash-attn: {{bestSettings.FlashAttention}}
 - cache-type-k: {{bestSettings.CacheTypeK ?? "f16"}} / cache-type-v: {{bestSettings.CacheTypeV ?? "f16"}}
 - threads: {{bestSettings.Threads}} / mmap: {{bestSettings.Mmap}} / mlock: {{bestSettings.Mlock}}
+- repeat-penalty: {{bestSettings.RepeatPenalty?.ToString() ?? "server default"}} / repeat-last-n: {{bestSettings.RepeatLastN?.ToString() ?? "server default"}} / dry-multiplier: {{bestSettings.DryMultiplier?.ToString() ?? "server default"}}
 
 ALREADY TRIED:
 {{string.Join("\n", triedSummary)}}
@@ -282,7 +288,8 @@ We need a fresh approach. Think carefully about:
 - KV cache quantization levels not yet tried (this is a speed/VRAM lever, not a quality one — don't suggest it purely for quality)
 - Thread count tuning for CPU-bound operations
 - Mlock if the model fits in RAM
-- Ubatch vs batch ratios{{moeParam}}
+- Ubatch vs batch ratios
+- If quality has cratered (likely a repetition loop): RepeatPenalty, RepeatLastN, or DryMultiplier haven't necessarily been tried yet{{moeParam}}
 
 If you genuinely believe no further optimization is possible given what has been tried and the hardware constraints, respond with exactly:
 DONE
@@ -394,6 +401,21 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
                     bool thinking = value.GetBoolean();
                     return (settings.ThinkingEnabled, thinking != settings.ThinkingEnabled ? thinking : (object?)null);
 
+                case "RepeatPenalty":
+                    // 1.0 = off, up to 1.5 (higher starts actively hurting coherence)
+                    float rp = Math.Clamp(value.GetSingle(), 1.0f, 1.5f);
+                    return (settings.RepeatPenalty, rp != settings.RepeatPenalty ? rp : (object?)null);
+
+                case "RepeatLastN":
+                    // -1 = whole context, 0 = off, otherwise a token window
+                    int rln = Math.Clamp(value.GetInt32(), -1, 8192);
+                    return (settings.RepeatLastN, rln != settings.RepeatLastN ? rln : (object?)null);
+
+                case "DryMultiplier":
+                    // 0 = off, up to 2.0 (higher becomes overly aggressive)
+                    float dry = Math.Clamp(value.GetSingle(), 0f, 2.0f);
+                    return (settings.DryMultiplier, dry != settings.DryMultiplier ? dry : (object?)null);
+
                 default:
                     return (null, null);
             }
@@ -432,6 +454,24 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
         double baselineScore = session.Iterations[0].Result.CompositeScore;
         bool scoreImproved = best.CompositeScore > baselineScore;
         bool isMoe = LlamaSettings.IsMoeModel(session.ModelPath);
+
+        // A near-zero quality score is the signature of a degenerate repetition loop
+        // ("is is is is..."). Fix that before chasing any further speed gains — an
+        // unusable response is worse than a faster one.
+        if (best.QualityScore < 0.3)
+        {
+            if (!tried.Contains("RepeatPenalty") && bestSettings.RepeatPenalty is null or <= 1.0f)
+                return Change("RepeatPenalty", bestSettings.RepeatPenalty?.ToString() ?? "server default", 1.1f,
+                    "Quality score has cratered, likely a repetition loop — raising repeat-penalty to discourage it");
+
+            if (!tried.Contains("DryMultiplier") && bestSettings.DryMultiplier is null or <= 0f)
+                return Change("DryMultiplier", bestSettings.DryMultiplier?.ToString() ?? "server default", 0.8f,
+                    "Quality score is still cratered — enabling the DRY sampler to break repeat loops");
+
+            if (!tried.Contains("RepeatLastN") && bestSettings.RepeatLastN is null or 0)
+                return Change("RepeatLastN", bestSettings.RepeatLastN?.ToString() ?? "server default", 256,
+                    "Quality score is still cratered — widening the repeat-penalty lookback window");
+        }
 
         // User-configurable per run (see OptimizationSession.TargetTgSpeed); shared with
         // OptimizationSession.Best, which anchors future suggestions off the latest config
@@ -610,6 +650,9 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
             case "Mmap":            s.Mmap = Convert.ToBoolean(change.NewValue); break;
             case "MoeExpertUsed":   s.MoeExpertUsed = change.NewValue is null ? null : Convert.ToInt32(change.NewValue); break;
             case "ThinkingEnabled": s.ThinkingEnabled = change.NewValue is null ? null : Convert.ToBoolean(change.NewValue); break;
+            case "RepeatPenalty":   s.RepeatPenalty = change.NewValue is null ? null : Convert.ToSingle(change.NewValue); break;
+            case "RepeatLastN":     s.RepeatLastN = change.NewValue is null ? null : Convert.ToInt32(change.NewValue); break;
+            case "DryMultiplier":   s.DryMultiplier = change.NewValue is null ? null : Convert.ToSingle(change.NewValue); break;
         }
         return s;
     }

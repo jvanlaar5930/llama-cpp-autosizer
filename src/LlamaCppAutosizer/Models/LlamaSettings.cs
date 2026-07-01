@@ -42,6 +42,14 @@ public class LlamaSettings
     public float? RopeFreqBase { get; set; }
     public float? RopeFreqScale { get; set; }
 
+    // Anti-repetition sampling defaults (null = use llama-server's built-in default).
+    // These only take effect for clients that don't override sampling params per-request.
+    public float? RepeatPenalty { get; set; }
+    public int? RepeatLastN { get; set; }
+    // DRY sampler strength — llama.cpp's dedicated repeat-loop breaker ("is is is is...").
+    // 0 disables it; null leaves the server default (usually already enabled).
+    public float? DryMultiplier { get; set; }
+
     // Extra raw CLI args the user wants to inject
     public string? ExtraArgs { get; set; }
 
@@ -77,6 +85,9 @@ public class LlamaSettings
         if (RopeScaling is not null) { args.Add("--rope-scaling"); args.Add(RopeScaling); }
         if (RopeFreqBase.HasValue) { args.Add("--rope-freq-base"); args.Add(RopeFreqBase.Value.ToString()); }
         if (RopeFreqScale.HasValue) { args.Add("--rope-freq-scale"); args.Add(RopeFreqScale.Value.ToString()); }
+        if (RepeatPenalty.HasValue) { args.Add("--repeat-penalty"); args.Add(RepeatPenalty.Value.ToString()); }
+        if (RepeatLastN.HasValue) { args.Add("--repeat-last-n"); args.Add(RepeatLastN.Value.ToString()); }
+        if (DryMultiplier.HasValue) { args.Add("--dry-multiplier"); args.Add(DryMultiplier.Value.ToString()); }
 
         if (!string.IsNullOrWhiteSpace(ExtraArgs))
         {

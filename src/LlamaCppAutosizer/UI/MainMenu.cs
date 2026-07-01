@@ -377,7 +377,11 @@ public class MainMenu(
                 "[grey]\"favor large context over raw speed\" (empty to skip):[/]")
                 .AllowEmpty());
 
-        var opts = new OptimizationOptions(MaxIterations: maxIter);
+        bool includeStressTest = AnsiConsole.Confirm(
+            "[grey]Include a long-form repetition-loop stress test in each benchmark? " +
+            "(slower iterations, more likely to catch degenerate/looping output)[/]", false);
+
+        var opts = new OptimizationOptions(MaxIterations: maxIter, IncludeRepetitionStressTest: includeStressTest);
 
         // Single session shared with the optimizer — CompletionReason and iteration history
         // are written directly to this object, so the final display is always correct.

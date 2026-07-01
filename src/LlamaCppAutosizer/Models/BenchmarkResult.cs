@@ -14,6 +14,9 @@ public class RunTimings
 
     /// <summary>Time from request sent to first response byte, in ms.</summary>
     public double TimeToFirstTokenMs { get; set; }
+
+    /// <summary>Generated text, kept only long enough to check for degenerate repetition.</summary>
+    public string GeneratedText { get; set; } = "";
 }
 
 public class BenchmarkResult

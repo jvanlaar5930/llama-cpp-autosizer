@@ -7,7 +7,8 @@ public record OptimizationOptions(
     int MaxIterations = 20,
     double ConvergenceThreshold = 0.01,
     int ConvergencePatience = 3,
-    int Port = 8080
+    int Port = 8080,
+    bool IncludeRepetitionStressTest = false
 );
 
 public class OptimizerService(
@@ -50,7 +51,8 @@ public class OptimizerService(
             var effectiveInitialSettings = server.LastEffectiveSettings ?? initialSettings;
             string? initialAdjustment = server.LastStartAdjustmentNote;
 
-            var baselineResult = await benchmarks.RunAsync(effectiveInitialSettings, modelPath, profile, ct);
+            var baselineResult = await benchmarks.RunAsync(effectiveInitialSettings, modelPath, profile, ct,
+                options.IncludeRepetitionStressTest);
             baselineResult.CompositeScore = profile.ScoreResult(baselineResult);
             baselineResult.Notes = "Baseline";
 
@@ -183,7 +185,8 @@ public class OptimizerService(
                 BenchmarkResult iterResult;
                 try
                 {
-                    iterResult = await benchmarks.RunAsync(nextSettings, modelPath, profile, ct);
+                    iterResult = await benchmarks.RunAsync(nextSettings, modelPath, profile, ct,
+                        options.IncludeRepetitionStressTest);
                     iterResult.CompositeScore = profile.ScoreResult(iterResult);
                 }
                 catch (Exception ex)
@@ -296,6 +299,9 @@ public class OptimizerService(
                 FlashAttention = false,
                 Mmap           = true,
                 ThinkingEnabled = isThinking ? false : null,
+                RepeatPenalty  = DefaultRepeatPenalty,
+                RepeatLastN    = DefaultRepeatLastN,
+                DryMultiplier  = DefaultDryMultiplier,
                 Label          = "baseline",
             };
         }
@@ -334,9 +340,20 @@ public class OptimizerService(
             FlashAttention = preset.FlashAttn,
             Mmap           = true,
             ThinkingEnabled = isThinking ? false : null,
+            RepeatPenalty  = DefaultRepeatPenalty,
+            RepeatLastN    = DefaultRepeatLastN,
+            DryMultiplier  = DefaultDryMultiplier,
             Label          = "baseline",
         };
     }
+
+    // Conservative anti-repetition defaults applied to every baseline config. These guard
+    // against degenerate decoding loops ("is is is is...") from the very first iteration
+    // rather than only being discovered reactively after a benchmark's quality score craters.
+    // The optimizer can still loosen or tighten them further — see RecommendationService.
+    private const float DefaultRepeatPenalty = 1.1f;
+    private const int DefaultRepeatLastN = 256;
+    private const float DefaultDryMultiplier = 0.8f;
 
     // ── VRAM preset table ────────────────────────────────────────────────────
     // Keyed by minimum free VRAM (MB).  When free VRAM is between two tiers

@@ -14,7 +14,8 @@ public class BenchmarkService(
         LlamaSettings settings,
         string modelPath,
         OptimizationProfile profile,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        bool includeRepetitionStressTest = false)
     {
         var result = new BenchmarkResult
         {
@@ -51,6 +52,16 @@ public class BenchmarkService(
             if (runTiming is not null) timings.Add(runTiming);
         }
 
+        // Opt-in long-form run so the repetition-loop check below has enough tokens to
+        // actually catch a degenerate config — short benchmark prompts rarely run long
+        // enough to reveal it even though real long-form usage frequently does.
+        if (includeRepetitionStressTest && !string.IsNullOrWhiteSpace(profile.StressTestPrompt))
+        {
+            ct.ThrowIfCancellationRequested();
+            var stressTiming = await RunSinglePromptAsync(profile.StressTestPrompt, profile.StressTestMaxTokens, result, ct);
+            if (stressTiming is not null) timings.Add(stressTiming);
+        }
+
         // Agentic tool-use benchmarks
         double toolSuccessRate = 1.0;
         if (profile.Type == ProfileType.Agentic && profile.ToolBenchmarkPrompts.Count > 0)
@@ -58,11 +69,19 @@ public class BenchmarkService(
             toolSuccessRate = await RunToolBenchmarksAsync(profile, result, ct);
         }
 
-        // Aggregate
+        // Aggregate. Rates are weighted by tokens/time (not averaged per-run) because a
+        // run that generates very few tokens in a tiny amount of time reports an inflated
+        // per_second ratio that would otherwise dominate a plain average.
         if (timings.Count > 0)
         {
-            result.PromptProcessingRate = timings.Average(t => t.PromptPerSecond);
-            result.GenerationRate = timings.Average(t => t.PredictedPerSecond);
+            double promptMs = timings.Sum(t => t.PromptMs);
+            double predictedMs = timings.Sum(t => t.PredictedMs);
+            result.PromptProcessingRate = promptMs > 0
+                ? timings.Sum(t => t.PromptTokens) / promptMs * 1000.0
+                : 0;
+            result.GenerationRate = predictedMs > 0
+                ? timings.Sum(t => t.PredictedTokens) / predictedMs * 1000.0
+                : 0;
             result.TimeToFirstTokenMs = timings.Average(t => t.TimeToFirstTokenMs);
             result.AverageTotalMs = timings.Average(t => t.TotalMs);
         }
@@ -99,6 +118,7 @@ public class BenchmarkService(
                 PredictedPerSecond = t.PredictedPerSecond,
                 TotalMs = t.TotalMs,
                 TimeToFirstTokenMs = ttftMs,
+                GeneratedText = response.Content,
             };
             result.IndividualRuns.Add(timing);
             return timing;
@@ -168,6 +188,15 @@ public class BenchmarkService(
     {
         if (timings.Count == 0) return 0.0;
 
+        // A degenerate repetition loop ("is is is is...") means the config produced
+        // unusable output — that overrides every other quality signal below.
+        if (timings.Any(t => HasRepetitionLoop(t.GeneratedText)))
+        {
+            result.Notes = (result.Notes is null ? "" : result.Notes + " ") +
+                "Repetition loop detected in generated output — quality score zeroed.";
+            return 0.0;
+        }
+
         // Simple heuristic quality score based on:
         // 1. Completion rate (did we get outputs at all?)
         // 2. Minimum token count (did the model produce substantive output?)
@@ -184,5 +213,25 @@ public class BenchmarkService(
         double speedPenalty = result.GenerationRate < 1.0 ? 0.5 : 1.0;
 
         return completionRate * lengthScore * speedPenalty;
+    }
+
+    // Detects decoding loops where a short word or phrase (1-3 words) repeats back-to-back
+    // enough times that it can only be a stuck loop, not natural language repetition.
+    private static bool HasRepetitionLoop(string text)
+    {
+        var words = text.Split((char[]?)null!, StringSplitOptions.RemoveEmptyEntries);
+        if (words.Length < 12) return false;
+
+        for (int n = 1; n <= 3; n++)
+        {
+            int run = 0;
+            for (int i = n; i < words.Length; i++)
+            {
+                bool same = string.Equals(words[i], words[i - n], StringComparison.OrdinalIgnoreCase);
+                run = same ? run + 1 : 0;
+                if (run >= 10) return true;
+            }
+        }
+        return false;
     }
 }

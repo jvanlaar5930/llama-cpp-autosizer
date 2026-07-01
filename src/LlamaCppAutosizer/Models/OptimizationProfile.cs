@@ -36,6 +36,13 @@ public record class OptimizationProfile
     public List<ToolDefinition> ToolDefinitions { get; init; } = [];
     public List<string> ToolBenchmarkPrompts { get; init; } = [];
 
+    // Opt-in long-form generation used to surface degenerate repetition loops
+    // ("is is is is...") that short benchmark prompts rarely run long enough to reach.
+    public string? StressTestPrompt { get; init; } =
+        "List and explain in detail 40 distinct, non-repeating tips for improving software code review quality. " +
+        "Number each one and give a full paragraph of justification for each.";
+    public int StressTestMaxTokens { get; init; } = 1536;
+
     // -------------------------------------------------------------------------
     // Built-in profiles
     // -------------------------------------------------------------------------
