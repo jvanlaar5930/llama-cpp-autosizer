@@ -115,6 +115,8 @@ public static class BenchmarkDisplay
                     .AddRow("[grey]Profile[/]", $"[cyan]{session.Profile}[/]")
                     .AddRow("[grey]Iterations[/]", $"[cyan]{session.Iterations.Count}[/]")
                     .AddRow("[grey]Best score[/]", $"[bold green]{r.CompositeScore:F3}[/]")
+                    .AddRow("[grey]Context[/]", $"[cyan]{s.ContextSize:N0} tokens[/]")
+                    .AddRow("[grey]GPU layers[/]", $"[cyan]{(s.GpuLayers == -1 ? "all" : s.GpuLayers)}[/]")
                     .AddRow("[grey]PP speed[/]", $"[cyan]{r.PromptProcessingRate:F1} t/s[/]")
                     .AddRow("[grey]TG speed[/]", $"[cyan]{r.GenerationRate:F1} t/s[/]")
                     .AddRow("[grey]TTFT[/]", $"[cyan]{r.TimeToFirstTokenMs:F0} ms[/]")
