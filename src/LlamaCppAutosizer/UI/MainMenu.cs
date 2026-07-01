@@ -363,6 +363,14 @@ public class MainMenu(
                     ? ValidationResult.Success()
                     : ValidationResult.Error("Must be 2–50")));
 
+        double targetTgSpeed = AnsiConsole.Prompt(
+            new TextPrompt<double>(
+                "[grey]Target generation speed (t/s) — once reached, further tuning favors quality over more speed:[/]")
+                .DefaultValue(30.0)
+                .Validate(v => v > 0
+                    ? ValidationResult.Success()
+                    : ValidationResult.Error("Must be greater than 0")));
+
         string userGuidance = AnsiConsole.Prompt(
             new TextPrompt<string>(
                 "[grey]Any guidance for the optimizer, e.g. \"prioritize low VRAM usage\" or[/]\n" +
@@ -378,12 +386,13 @@ public class MainMenu(
             ModelPath = _modelPath,
             Profile = _profile.Type,
             Hardware = _hardware,   // optimizer will refresh this with a live DetectAsync
+            TargetTgSpeed = targetTgSpeed,
             UserGuidance = string.IsNullOrWhiteSpace(userGuidance) ? null : userGuidance.Trim(),
         };
 
         AnsiConsole.Clear();
         AnsiConsole.Write(new Rule("[bold cyan]Running Optimization[/]").RuleStyle("cyan"));
-        AnsiConsole.MarkupLine($"[grey]Model: {Markup.Escape(session.ModelName)}  Profile: {Markup.Escape(_profile.Name)}  Max iterations: {maxIter}[/]");
+        AnsiConsole.MarkupLine($"[grey]Model: {Markup.Escape(session.ModelName)}  Profile: {Markup.Escape(_profile.Name)}  Max iterations: {maxIter}  Target: {targetTgSpeed:F0}t/s[/]");
         if (session.UserGuidance is not null)
             AnsiConsole.MarkupLine($"[grey]Guidance:[/] [italic]{Markup.Escape(session.UserGuidance)}[/]");
         AnsiConsole.MarkupLine("[yellow]⚠ System may become slow or unresponsive during benchmarking — this is normal.[/]");
@@ -487,6 +496,16 @@ public class MainMenu(
             footerLineCount = lines.Count;
         }
 
+        // Footer redraw erases N lines by cursor-up, assuming 1 logical line == 1 physical
+        // row. A status/reasoning string longer than the terminal width soft-wraps into
+        // extra rows the erase math doesn't know about, leaving stacked duplicate garbage
+        // on every redraw. Clip raw (pre-markup) text so that invariant always holds.
+        string ClipToWidth(string text, int reserve)
+        {
+            int max = Math.Max(10, Console.WindowWidth - reserve);
+            return text.Length > max ? text[..(max - 1)] + "…" : text;
+        }
+
         string BuildProgressLine()
         {
             double pct = maxIter > 0 ? (double)iterDone / (maxIter + 1) * 100.0 : 0;
@@ -535,7 +554,7 @@ public class MainMenu(
                              $"PP=[cyan]{iter.Result.PromptProcessingRate:F0}t/s[/]" +
                              bestMark;
                 lastIterSub = iter.StatusMessage is not null
-                    ? Markup.Escape(iter.StatusMessage)
+                    ? Markup.Escape(ClipToWidth(iter.StatusMessage, 4))
                     : "";
 
                 var statusLines = new List<string> { lastIterStatus };

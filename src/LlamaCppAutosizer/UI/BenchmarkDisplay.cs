@@ -6,32 +6,20 @@ namespace LlamaCppAutosizer.UI;
 public static class BenchmarkDisplay
 {
     /// <summary>
-    /// Renders a live-updating display during optimization.
-    /// Pass iterations from OptimizerService.OptimizeAsync() to `onIteration`.
+    /// Full per-iteration history — what was tried, why (the recommender's reasoning,
+    /// whether it came from the LLM or a heuristic), and the resulting score/speeds.
+    /// Used both right after an optimization run and when re-loading a past session.
     /// </summary>
-    public static async Task RunLiveAsync(
-        IAsyncEnumerable<OptimizationIteration> iterations,
-        OptimizationSession session,
-        CancellationToken ct = default)
+    public static void RenderIterationHistory(OptimizationSession session)
     {
-        var table = BuildIterationTable();
-        var bestPanel = new Panel("Waiting for first result...") { Border = BoxBorder.Rounded };
+        if (session.Iterations.Count == 0) return;
 
-        await AnsiConsole.Live(new Rows(
-                new Rule("[bold cyan]Optimization Progress[/]").RuleStyle("cyan"),
-                table,
-                new Rule("[bold green]Best Result[/]").RuleStyle("green"),
-                bestPanel))
-            .AutoClear(false)
-            .StartAsync(async ctx =>
-            {
-                await foreach (var iter in iterations.WithCancellation(ct))
-                {
-                    AddIterationRow(table, iter);
-                    UpdateBestPanel(bestPanel, session);
-                    ctx.Refresh();
-                }
-            });
+        var table = BuildIterationTable();
+        foreach (var iter in session.Iterations)
+            AddIterationRow(table, iter);
+
+        AnsiConsole.Write(new Rule("[bold]Optimization History[/]").RuleStyle("grey"));
+        AnsiConsole.Write(table);
     }
 
     private static Table BuildIterationTable()
@@ -48,6 +36,7 @@ public static class BenchmarkDisplay
         t.AddColumn(new TableColumn("[grey]TTFT ms[/]").RightAligned());
         t.AddColumn(new TableColumn("[grey]Score[/]").RightAligned());
         t.AddColumn("[grey]Source[/]");
+        t.AddColumn("[grey]Reasoning / Notes[/]");
         return t;
     }
 
@@ -60,53 +49,40 @@ public static class BenchmarkDisplay
 
         string change = iter.AppliedChange is null
             ? "[grey]baseline[/]"
-            : $"[yellow]{iter.AppliedChange.Parameter}[/] → [cyan]{iter.AppliedChange.NewValue}[/]";
+            : $"[yellow]{Markup.Escape(iter.AppliedChange.Parameter)}[/] → [cyan]{Markup.Escape(iter.AppliedChange.NewValue?.ToString() ?? "")}[/]";
 
         string source = iter.AppliedChange?.Source switch
         {
             "llm" => "[magenta]LLM[/]",
+            "llm-push" => "[magenta]LLM★[/]",
             "user" => "[green]user[/]",
             _ => "[grey]heuristic[/]",
         };
 
-        string score = iter.IsBestSoFar
-            ? $"[bold green]{r.CompositeScore:F3}[/]"
+        bool wasSkipped = iter.AppliedChange is not null && r.CompositeScore == 0 && r.GenerationRate == 0;
+        string score = wasSkipped ? "[red]—[/]"
+            : iter.IsBestSoFar ? $"[bold green]{r.CompositeScore:F3}[/]"
             : $"[grey]{r.CompositeScore:F3}[/]";
+
+        // Skipped iterations: show why the server failed to start (from StatusMessage), not
+        // the change's original reasoning — the failure is the more useful fact here.
+        // Otherwise prefer the recommender's own reasoning, falling back to the full status
+        // line (which also carries any auto-adjustment note) when there's no structured reasoning.
+        string notes = wasSkipped
+            ? Markup.Escape(iter.StatusMessage ?? "")
+            : !string.IsNullOrWhiteSpace(iter.AppliedChange?.Reasoning)
+                ? Markup.Escape(iter.AppliedChange.Reasoning)
+                : Markup.Escape(iter.StatusMessage ?? "");
 
         table.AddRow(
             num,
             change,
-            $"{r.PromptProcessingRate,7:F1}",
-            $"{r.GenerationRate,6:F1}",
-            $"{r.TimeToFirstTokenMs,6:F0}",
+            wasSkipped ? "[grey]—[/]" : $"{r.PromptProcessingRate,7:F1}",
+            wasSkipped ? "[grey]—[/]" : $"{r.GenerationRate,6:F1}",
+            wasSkipped ? "[grey]—[/]" : $"{r.TimeToFirstTokenMs,6:F0}",
             score,
-            source);
-    }
-
-    private static void UpdateBestPanel(Panel panel, OptimizationSession session)
-    {
-        if (session.Best is null) return;
-
-        var best = session.Best;
-        var r = best.Result;
-        var s = best.Settings;
-
-        var content = new Table().Border(TableBorder.None).HideHeaders();
-        content.AddColumn("K").AddColumn("V");
-
-        content.AddRow("[grey]Score[/]", $"[bold green]{r.CompositeScore:F3}[/]");
-        content.AddRow("[grey]PP[/]", $"[cyan]{r.PromptProcessingRate:F1} t/s[/]");
-        content.AddRow("[grey]TG[/]", $"[cyan]{r.GenerationRate:F1} t/s[/]");
-        content.AddRow("[grey]TTFT[/]", $"[cyan]{r.TimeToFirstTokenMs:F0} ms[/]");
-        content.AddRow("[grey]Settings[/]", $"[grey]{s.Summary()}[/]");
-        content.AddRow("[grey]Iteration[/]", $"[grey]{best.Number}[/]");
-
-        panel.Header = new PanelHeader("[bold green]Best Settings Found[/]");
-        panel.Padding = new Padding(1, 0);
-
-        // Spectre Panel doesn't support dynamic content replacement easily,
-        // so we embed the table directly in the panel renderable
-        // (the Live context will re-render the full tree)
+            source,
+            notes);
     }
 
     // -------------------------------------------------------------------------
@@ -172,6 +148,9 @@ public static class BenchmarkDisplay
             AnsiConsole.WriteLine();
             AnsiConsole.MarkupLine($"[grey]vs baseline:[/] PP [green]+{ppImprove:F1}%[/]  TG [green]+{tgImprove:F1}%[/]");
         }
+
+        AnsiConsole.WriteLine();
+        RenderIterationHistory(session);
     }
 
     public static void RenderSessionList(List<string> sessionFiles)

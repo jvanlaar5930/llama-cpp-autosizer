@@ -31,8 +31,38 @@ public class OptimizationSession
 
     public List<OptimizationIteration> Iterations { get; init; } = [];
 
-    public OptimizationIteration? Best =>
-        Iterations.MaxBy(i => i.Result.CompositeScore);
+    // Once generation speed reaches this, further tuning should spend headroom on quality
+    // instead of chasing more raw speed. Shared with RecommendationService's heuristic tiers.
+    // User-configurable per run (see MainMenu's optimization setup prompt); 30 t/s default.
+    public double TargetTgSpeed { get; set; } = 30.0;
+
+    /// <summary>
+    /// The iteration that future recommendations should branch from, and the one reported
+    /// as the run's result.
+    ///
+    /// Below the speed target: highest composite score seen (as before) — chase the best
+    /// available speed/quality balance.
+    ///
+    /// At/above the speed target: the *latest* iteration that still clears the target, even
+    /// if its composite score is lower than an earlier, faster-but-lower-quality iteration.
+    /// This lets quality-oriented moves (restoring MoE experts, growing context) stick as the
+    /// new anchor and keep chaining forward, rather than snapping back to a faster config just
+    /// because it scored higher on the speed-weighted composite metric.
+    /// </summary>
+    public OptimizationIteration? Best
+    {
+        get
+        {
+            // Skip start-failure placeholders (GenerationRate == 0 means the benchmark never ran).
+            var valid = Iterations.Where(i => i.Result.GenerationRate > 0).ToList();
+            if (valid.Count == 0) return Iterations.MaxBy(i => i.Result.CompositeScore);
+
+            var meetingTarget = valid.Where(i => i.Result.GenerationRate >= TargetTgSpeed).ToList();
+            return meetingTarget.Count > 0
+                ? meetingTarget.MaxBy(i => i.Number)
+                : valid.MaxBy(i => i.Result.CompositeScore);
+        }
+    }
 
     public BenchmarkResult? BestResult => Best?.Result;
     public LlamaSettings? BestSettings => Best?.Settings;

@@ -197,23 +197,27 @@ BEST SETTINGS SO FAR (score={{best.CompositeScore:F3}} | TG={{best.GenerationRat
 - flash-attn: {{bestSettings.FlashAttention}}
 - cache-type-k: {{bestSettings.CacheTypeK ?? "f16"}} / cache-type-v: {{bestSettings.CacheTypeV ?? "f16"}}
 - threads: {{bestSettings.Threads}} (-1 = auto)
-- mlock: {{bestSettings.Mlock}}
+- mmap: {{bestSettings.Mmap}} / mlock: {{bestSettings.Mlock}}
 
 FULL OPTIMIZATION HISTORY:
 {{string.Join("\n", historyLines)}}
 
-GOAL: Improve composite score above {{best.CompositeScore:F3}}.
-RULE: If a parameter made things worse, try something else OR a different value for it.
+GOAL: Target generation speed is {{session.TargetTgSpeed:F0}}t/s.
+- Below {{session.TargetTgSpeed:F0}}t/s: prioritize whatever raises TG speed most (GPU layers, flash-attn, mmap, KV cache quantization, batch size).
+- At or above {{session.TargetTgSpeed:F0}}t/s with only modest headroom: prefer growing ContextSize (in +16,384 steps) for more capability — it's free upside that doesn't cost the speed already banked.
+- Well above {{session.TargetTgSpeed:F0}}t/s (lots of headroom, e.g. {{session.TargetTgSpeed + LotsOfHeadroomAboveTarget:F0}}t/s+): it's fine to give back some speed for quality — e.g. restore MoE active-expert count toward the model default — as long as TG stays at/above {{session.TargetTgSpeed:F0}}t/s.
+RULE: If a parameter made things worse, try something else OR a different value for it. Never suggest changing cache-type-k/cache-type-v purely to "improve quality" — that's a speed/VRAM lever, not a quality one.
 
 Valid parameters and example values:
 - GpuLayers: -1 (all layers), or a positive integer up to 200
-- ContextSize: power of 2 — 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536
+- ContextSize: {{bestSettings.ContextSize + 16384}}, {{bestSettings.ContextSize + 32768}}, ... in steps of 16,384, up to 131072
 - BatchSize: 64, 128, 256, 512, 1024, 2048
 - UBatchSize: 32, 64, 128, 256, 512, 1024
 - FlashAttention: true or false
 - CacheTypeK: "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"
 - CacheTypeV: "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"
 - Threads: -1 (auto), or 1–{{hardware.CpuThreads}}
+- Mmap: true or false (disabling forces the full model into RAM up front)
 - Mlock: true or false{{moeParam}}
 
 Respond with ONLY this JSON (no markdown, no extra text before or after):
@@ -258,16 +262,24 @@ BEST SETTINGS (score={{best.CompositeScore:F3}} vs baseline={{baselineScore:F3}}
 - batch-size: {{bestSettings.BatchSize}} / ubatch-size: {{bestSettings.UBatchSize}}
 - flash-attn: {{bestSettings.FlashAttention}}
 - cache-type-k: {{bestSettings.CacheTypeK ?? "f16"}} / cache-type-v: {{bestSettings.CacheTypeV ?? "f16"}}
-- threads: {{bestSettings.Threads}} / mlock: {{bestSettings.Mlock}}
+- threads: {{bestSettings.Threads}} / mmap: {{bestSettings.Mmap}} / mlock: {{bestSettings.Mlock}}
 
 ALREADY TRIED:
 {{string.Join("\n", triedSummary)}}
 
+TARGET: {{session.TargetTgSpeed:F0}}t/s generation speed. Current TG is {{best.GenerationRate:F0}}t/s.
+{{(best.GenerationRate >= session.TargetTgSpeed + LotsOfHeadroomAboveTarget
+    ? "We're well above target — it's fine to trade some of that speed back for quality (e.g. restore MoE active-expert count) as long as TG stays at/above the target."
+    : best.GenerationRate >= session.TargetTgSpeed
+        ? "We're at/above target — prefer growing ContextSize (in +16,384 steps, up to 131072) over further speed cuts."
+        : "We're below target — prioritize whatever raises TG speed most.")}}
+
 We need a fresh approach. Think carefully about:
 - Whether a completely different GPU layer count might hit a sweet spot
-- Context sizes not yet tried (both smaller for speed, larger if VRAM permits)
+- Toggling mmap on/off — hasn't necessarily been tried yet and can meaningfully shift TG speed
+- Context sizes not yet tried, in +16,384 steps (larger if VRAM permits, up to 131072)
 - Combinations we haven't explored (e.g. flash-attn + smaller ubatch)
-- KV cache quantization levels not yet tried
+- KV cache quantization levels not yet tried (this is a speed/VRAM lever, not a quality one — don't suggest it purely for quality)
 - Thread count tuning for CPU-bound operations
 - Mlock if the model fits in RAM
 - Ubatch vs batch ratios{{moeParam}}
@@ -368,6 +380,10 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
                     bool ml = value.GetBoolean();
                     return (settings.Mlock, ml != settings.Mlock ? ml : (object?)null);
 
+                case "Mmap":
+                    bool mm = value.GetBoolean();
+                    return (settings.Mmap, mm != settings.Mmap ? mm : (object?)null);
+
                 case "MoeExpertUsed":
                     // 1–256; 0 means "model default" (treated as null = don't pass the arg)
                     int experts = Math.Clamp(value.GetInt32(), 0, 256);
@@ -392,6 +408,14 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
     // Heuristic recommendation
     // -------------------------------------------------------------------------
 
+    // How far above the target counts as "a lot" of headroom — worth actively giving back
+    // some speed for quality (e.g. restoring MoE experts), rather than just growing context.
+    private const double LotsOfHeadroomAboveTarget = 15.0;
+    private const int ContextStep = 16384;
+    // Hard ceiling for context growth regardless of profile default — most models top out
+    // well below this, and a failed start here just teaches the optimizer where the wall is.
+    private const int ContextCeiling = 131072;
+
     public ParameterChange? GetHeuristicRecommendation(
         OptimizationSession session,
         OptimizationProfile profile,
@@ -408,6 +432,40 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
         double baselineScore = session.Iterations[0].Result.CompositeScore;
         bool scoreImproved = best.CompositeScore > baselineScore;
         bool isMoe = LlamaSettings.IsMoeModel(session.ModelPath);
+
+        // User-configurable per run (see OptimizationSession.TargetTgSpeed); shared with
+        // OptimizationSession.Best, which anchors future suggestions off the latest config
+        // that still clears this bar rather than the highest composite score.
+        double targetTgSpeed = session.TargetTgSpeed;
+        double tgHeadroom = best.GenerationRate - targetTgSpeed;
+        bool aboveSpeedTarget = tgHeadroom >= 0;
+        bool lotsOfSpeedHeadroom = tgHeadroom >= LotsOfHeadroomAboveTarget;
+
+        // ── Speed target already met: spend the headroom on quality instead of chasing
+        // more raw speed. A lot of headroom → actively give some back for quality (more MoE
+        // experts). Any headroom → keep growing context, since more context is free capability
+        // that doesn't cost the speed we've already banked.
+        if (aboveSpeedTarget)
+        {
+            if (lotsOfSpeedHeadroom && isMoe && bestSettings.MoeExpertUsed.HasValue)
+            {
+                bool alreadyRestoredDefault = session.Iterations.Any(i =>
+                    i.AppliedChange?.Parameter == "MoeExpertUsed" && i.AppliedChange.NewValue is null);
+                if (!alreadyRestoredDefault)
+                    return Change("MoeExpertUsed", bestSettings.MoeExpertUsed.Value, null!,
+                        $"TG={best.GenerationRate:F0}t/s is well above the {targetTgSpeed:F0}t/s target — " +
+                        "restoring full expert count for better quality");
+            }
+
+            int? qualityCtx = NextContextStep(session, bestSettings);
+            if (qualityCtx is not null)
+                return Change("ContextSize", bestSettings.ContextSize, qualityCtx.Value,
+                    $"TG={best.GenerationRate:F0}t/s is at/above the {targetTgSpeed:F0}t/s target — " +
+                    $"growing context {bestSettings.ContextSize:N0} → {qualityCtx.Value:N0} tokens for more capability");
+        }
+
+        // ── Below target (or no further quality moves available above it): keep chasing the
+        // best available balance of speed and quality, as before.
 
         // If VRAM is available and GPU layers aren't already maxed (-1 = all), try more
         if (!tried.Contains("GpuLayers") && hardware.HasGpu && bestSettings.GpuLayers != -1)
@@ -437,6 +495,14 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
             return Change("FlashAttention", false, true,
                 "Flash attention reduces VRAM usage and often improves throughput");
 
+        // Toggle mmap — disabling forces the full model into RAM up front (can help steady-state
+        // TG if RAM allows it); re-enabling lets the OS page cache manage it (helps if RAM is tight).
+        if (!tried.Contains("Mmap"))
+            return Change("Mmap", bestSettings.Mmap, !bestSettings.Mmap,
+                bestSettings.Mmap
+                    ? "Disabling mmap forces the full model into RAM up front, which can improve steady-state TG speed"
+                    : "Re-enabling mmap lets the OS page cache manage the model file, which can help if RAM is tight");
+
         // Try KV cache quantization to free VRAM for more context or layers
         if (!tried.Contains("CacheTypeK") && bestSettings.CacheTypeK is null or "f16")
             return Change("CacheTypeK", bestSettings.CacheTypeK ?? "f16", "q8_0",
@@ -452,6 +518,7 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
             int nextExperts = Math.Max(1, bestSettings.MoeExpertUsed.Value - 2);
             bool alreadyTried = session.Iterations.Any(i =>
                 i.AppliedChange?.Parameter == "MoeExpertUsed" &&
+                i.AppliedChange.NewValue is not null &&
                 Convert.ToInt32(i.AppliedChange.NewValue) == nextExperts);
             if (!alreadyTried)
                 return Change("MoeExpertUsed", bestSettings.MoeExpertUsed.Value, nextExperts,
@@ -469,19 +536,14 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
                         : "Larger batch size improves PP throughput for agentic workloads");
         }
 
-        // Progressive context expansion — both profiles.
-        // Step up by 2× each time, but only when score has improved from baseline,
-        // and only if this specific target value hasn't already been tried.
-        if (bestSettings.ContextSize < profile.TargetContextSize && scoreImproved)
+        // Progressive context expansion — both profiles. +16,384 tokens per step, only while
+        // score has been improving, and only if this specific target value hasn't been tried.
+        if (scoreImproved)
         {
-            int nextCtx = Math.Min(bestSettings.ContextSize * 2, profile.TargetContextSize);
-            bool alreadyTriedThisValue = session.Iterations.Any(i =>
-                i.AppliedChange?.Parameter == "ContextSize" &&
-                Convert.ToInt32(i.AppliedChange.NewValue) == nextCtx);
-
-            if (!alreadyTriedThisValue)
-                return Change("ContextSize", bestSettings.ContextSize, nextCtx,
-                    $"Score is improving — expanding context {bestSettings.ContextSize:N0} → {nextCtx:N0} tokens");
+            int? nextCtx = NextContextStep(session, bestSettings);
+            if (nextCtx is not null)
+                return Change("ContextSize", bestSettings.ContextSize, nextCtx.Value,
+                    $"Score is improving — expanding context {bestSettings.ContextSize:N0} → {nextCtx.Value:N0} tokens");
         }
 
         // Escalate KV quant if the first round helped
@@ -500,19 +562,31 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
 
         // If context hasn't been expanded yet (score hasn't improved enough to trigger
         // the gate above) but we've run out of other ideas, try it anyway as a last resort.
-        if (bestSettings.ContextSize < profile.TargetContextSize)
         {
-            int nextCtx = Math.Min(bestSettings.ContextSize * 2, profile.TargetContextSize);
-            bool alreadyTriedThisValue = session.Iterations.Any(i =>
-                i.AppliedChange?.Parameter == "ContextSize" &&
-                Convert.ToInt32(i.AppliedChange.NewValue) == nextCtx);
-
-            if (!alreadyTriedThisValue)
-                return Change("ContextSize", bestSettings.ContextSize, nextCtx,
-                    $"Trying larger context {bestSettings.ContextSize:N0} → {nextCtx:N0} tokens as a final exploration");
+            int? nextCtx = NextContextStep(session, bestSettings);
+            if (nextCtx is not null)
+                return Change("ContextSize", bestSettings.ContextSize, nextCtx.Value,
+                    $"Trying larger context {bestSettings.ContextSize:N0} → {nextCtx.Value:N0} tokens as a final exploration");
         }
 
         return null; // Nothing left to try
+    }
+
+    // Next context-size step (+16,384 tokens, capped at ContextCeiling), or null if already
+    // at the ceiling or this exact value has already been tried.
+    private static int? NextContextStep(OptimizationSession session, LlamaSettings bestSettings)
+    {
+        if (bestSettings.ContextSize >= ContextCeiling) return null;
+
+        int nextCtx = Math.Min(bestSettings.ContextSize + ContextStep, ContextCeiling);
+        if (nextCtx <= bestSettings.ContextSize) return null;
+
+        bool alreadyTried = session.Iterations.Any(i =>
+            i.AppliedChange?.Parameter == "ContextSize" &&
+            i.AppliedChange.NewValue is not null &&
+            Convert.ToInt32(i.AppliedChange.NewValue) == nextCtx);
+
+        return alreadyTried ? null : nextCtx;
     }
 
     private static ParameterChange Change(string param, object oldVal, object newVal, string reason)
@@ -533,6 +607,7 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text):
             case "CacheTypeV":      s.CacheTypeV = change.NewValue?.ToString(); break;
             case "Threads":         s.Threads = Convert.ToInt32(change.NewValue); break;
             case "Mlock":           s.Mlock = Convert.ToBoolean(change.NewValue); break;
+            case "Mmap":            s.Mmap = Convert.ToBoolean(change.NewValue); break;
             case "MoeExpertUsed":   s.MoeExpertUsed = change.NewValue is null ? null : Convert.ToInt32(change.NewValue); break;
             case "ThinkingEnabled": s.ThinkingEnabled = change.NewValue is null ? null : Convert.ToBoolean(change.NewValue); break;
         }

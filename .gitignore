@@ -22,3 +22,5 @@ profiles/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+autosizer-config.json

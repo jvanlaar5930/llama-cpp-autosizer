@@ -1,6 +1,0 @@
-{
-  "serverExecutable": "C:\\llama.cpp\\llama-cpp-turboquant\\build\\bin\\Release",
-  "modelFolder": "C:\\Users\\joelv\\.lmstudio\\models",
-  "modelPath": "C:\\Users\\joelv\\.lmstudio\\models\\lmstudio-community\\gemma-4-26B-A4B-it-GGUF\\gemma-4-26B-A4B-it-Q4_K_M.gguf",
-  "profile": "Agentic"
-}
