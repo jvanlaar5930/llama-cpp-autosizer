@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using LlamaCppAutosizer.Models;
 using Microsoft.Extensions.Logging;
@@ -64,9 +65,18 @@ public class BenchmarkService(
 
         // Agentic tool-use benchmarks
         double toolSuccessRate = 1.0;
-        if (profile.Type == ProfileType.Agentic && profile.ToolBenchmarks.Count > 0)
+        double agentLoopScore = 1.0;
+        if (profile.Type == ProfileType.Agentic)
         {
-            toolSuccessRate = await RunToolBenchmarksAsync(profile, result, ct);
+            if (profile.ToolBenchmarks.Count > 0)
+                toolSuccessRate = await RunToolBenchmarksAsync(profile, result, ct);
+
+            if (profile.AgentLoopCases.Count > 0)
+            {
+                var (loopScore, effectiveTgRate) = await RunAgentLoopBenchmarksAsync(profile, ct);
+                agentLoopScore = loopScore;
+                result.AgentLoopEffectiveTgRate = effectiveTgRate;
+            }
         }
 
         // Accuracy probes: short prompts with objectively checkable answers. Run separately
@@ -99,6 +109,7 @@ public class BenchmarkService(
         result.SuccessfulRuns = timings.Count;
         result.FailedRuns = profile.BenchmarkPrompts.Count - timings.Count;
         result.ToolSuccessRate = toolSuccessRate;
+        result.AgentLoopScore = agentLoopScore;
         result.QualityScore = await ScoreQualityAsync(timings, result, ct);
 
         return result;
@@ -243,6 +254,132 @@ public class BenchmarkService(
         {
             return false;
         }
+    }
+
+    // Runs every AgentLoopCase and returns (average case score, effective tokens/sec across
+    // all round-trips). Unlike RunToolBenchmarksAsync this exercises a full multi-turn loop:
+    // tool call -> fabricated tool result fed back -> either the next chained call or a final
+    // free-text answer. The messages list keeps growing across turns within a case, so the
+    // server's own slot-based KV cache reuse kicks in the same way it would in a real
+    // harness session, instead of every turn re-processing the prompt from scratch.
+    private async Task<(double score, double effectiveTgRate)> RunAgentLoopBenchmarksAsync(
+        OptimizationProfile profile, CancellationToken ct)
+    {
+        object? toolsPayload = profile.ToolDefinitions.Count > 0
+            ? profile.ToolDefinitions.Select(t => new
+            {
+                type = "function",
+                function = new { name = t.Name, description = t.Description, parameters = t.Parameters }
+            }).ToArray()
+            : null;
+
+        double totalScore = 0;
+        long totalTokens = 0;
+        double totalWallMs = 0;
+        int ran = 0;
+
+        foreach (var loopCase in profile.AgentLoopCases)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var (caseScore, tokens, wallMs) = await RunAgentLoopCaseAsync(loopCase, toolsPayload, profile, ct);
+                totalScore += caseScore;
+                totalTokens += tokens;
+                totalWallMs += wallMs;
+                ran++;
+                logger.LogDebug("Agent loop case scored {Score:F2}: {Prompt}",
+                    caseScore, loopCase.Prompt[..Math.Min(50, loopCase.Prompt.Length)]);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning("Agent loop case failed: {Msg}", ex.Message);
+            }
+        }
+
+        double score = ran > 0 ? totalScore / profile.AgentLoopCases.Count : 1.0;
+        double effectiveTgRate = totalWallMs > 0 ? totalTokens / totalWallMs * 1000.0 : 0.0;
+        return (score, effectiveTgRate);
+    }
+
+    // Runs one multi-turn case: ExpectedToolSequence.Length tool round-trips (each graded on
+    // whether the expected tool was called with valid arguments), followed by a final
+    // free-text turn graded against FinalAnswerContains. A case that fails to produce a tool
+    // call mid-chain stops there — the remaining expected steps and the final turn score 0,
+    // since a real harness would also be stuck at that point.
+    //   Weighting: 0.7 * (fraction of expected tool steps completed correctly)
+    //            + 0.3 * (final answer correct / coherent)
+    private async Task<(double score, long tokens, double wallMs)> RunAgentLoopCaseAsync(
+        AgentLoopCase loopCase, object? toolsPayload, OptimizationProfile profile, CancellationToken ct)
+    {
+        var messages = new List<ChatMessage> { new() { Role = "user", Content = loopCase.Prompt } };
+        var sw = Stopwatch.StartNew();
+        long tokens = 0;
+        double stepCredit = 0;
+        int steps = loopCase.ExpectedToolSequence.Length;
+        bool aborted = false;
+
+        for (int i = 0; i < steps && !aborted; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var (response, _) = await server.ChatCompleteAsync(new ChatCompletionRequest
+            {
+                Messages = messages,
+                Tools = toolsPayload,
+                MaxTokens = 512,
+                Temperature = 0.1f,
+            }, ct);
+            tokens += response.Usage?.CompletionTokens ?? 0;
+
+            var call = response.Choices
+                .SelectMany(c => c.Message?.ToolCalls ?? [])
+                .FirstOrDefault(t => t.Function is not null);
+            if (call?.Function is null) { aborted = true; break; }
+
+            var definition = profile.ToolDefinitions
+                .FirstOrDefault(d => d.Name.Equals(call.Function.Name, StringComparison.OrdinalIgnoreCase));
+            bool validArgs = definition is not null && HasValidArguments(call.Function.Arguments, definition);
+            bool expectedTool = call.Function.Name.Equals(loopCase.ExpectedToolSequence[i], StringComparison.OrdinalIgnoreCase);
+            stepCredit += !validArgs ? 0.0 : expectedTool ? 1.0 : 0.5;
+
+            messages.Add(new ChatMessage
+            {
+                Role = "assistant",
+                Content = response.Choices[0].Message?.Content,
+                ToolCalls = [call],
+            });
+            messages.Add(new ChatMessage
+            {
+                Role = "tool",
+                ToolCallId = call.Id,
+                Content = i < loopCase.ToolResults.Length ? loopCase.ToolResults[i] : "OK",
+            });
+        }
+
+        double finalScore = 0;
+        if (!aborted)
+        {
+            // Final turn: no more tool calls expected — the model should synthesize an
+            // answer from the injected tool results rather than looping further.
+            var (finalResponse, _) = await server.ChatCompleteAsync(new ChatCompletionRequest
+            {
+                Messages = messages,
+                Tools = toolsPayload,
+                MaxTokens = 512,
+                Temperature = 0.1f,
+            }, ct);
+            tokens += finalResponse.Usage?.CompletionTokens ?? 0;
+
+            string finalText = finalResponse.FirstContent ?? "";
+            finalScore = loopCase.FinalAnswerContains.Length == 0
+                ? (finalText.Trim().Length > 0 && !finalResponse.HasToolCall ? 1.0 : 0.5)
+                : (loopCase.FinalAnswerContains.Any(a =>
+                    finalText.Contains(a, StringComparison.OrdinalIgnoreCase)) ? 1.0 : 0.0);
+        }
+
+        double stepScore = steps > 0 ? stepCredit / steps : 1.0;
+        double caseScore = 0.7 * stepScore + 0.3 * finalScore;
+        return (caseScore, tokens, sw.Elapsed.TotalMilliseconds);
     }
 
     // Runs the profile's accuracy probes and returns the fraction answered correctly.

@@ -15,6 +15,7 @@ services.AddLogging(b => b
 services.AddHttpClient();
 
 // Core services
+services.AddSingleton<AppSettingsService>();
 services.AddSingleton<HardwareDetectionService>();
 services.AddSingleton<LlamaServerService>();
 services.AddSingleton<BenchmarkService>();
@@ -26,6 +27,7 @@ services.AddSingleton<ProfileLibraryService>();
 
 // UI
 services.AddSingleton<ProfileMenu>();
+services.AddSingleton<AppSettingsMenu>();
 services.AddSingleton<MainMenu>();
 
 var provider = services.BuildServiceProvider();

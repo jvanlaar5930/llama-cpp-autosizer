@@ -5,9 +5,9 @@ using Microsoft.Extensions.Logging;
 
 namespace LlamaCppAutosizer.Services;
 
-public class ProfileLibraryService(ILogger<ProfileLibraryService> logger)
+public class ProfileLibraryService(AppSettingsService appSettings, ILogger<ProfileLibraryService> logger)
 {
-    private const string ProfilesDir = "profiles";
+    private string ProfilesDir => appSettings.Current.ProfilesDirectory;
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -24,9 +24,10 @@ public class ProfileLibraryService(ILogger<ProfileLibraryService> logger)
     public async Task SaveAsync(SavedProfile profile)
     {
         Directory.CreateDirectory(ProfilesDir);
-        await using var fs = new FileStream(profile.ProfileFile, FileMode.Create, FileAccess.Write);
+        string path = Path.Combine(ProfilesDir, profile.ProfileFileName);
+        await using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
         await JsonSerializer.SerializeAsync(fs, profile, JsonOpts);
-        logger.LogDebug("Profile saved: {Name} → {File}", profile.Name, profile.ProfileFile);
+        logger.LogDebug("Profile saved: {Name} → {File}", profile.Name, path);
     }
 
     public async Task<SavedProfile?> LoadAsync(string path)
@@ -63,8 +64,9 @@ public class ProfileLibraryService(ILogger<ProfileLibraryService> logger)
     {
         try
         {
-            if (File.Exists(profile.ProfileFile))
-                File.Delete(profile.ProfileFile);
+            string path = Path.Combine(ProfilesDir, profile.ProfileFileName);
+            if (File.Exists(path))
+                File.Delete(path);
         }
         catch (Exception ex)
         {

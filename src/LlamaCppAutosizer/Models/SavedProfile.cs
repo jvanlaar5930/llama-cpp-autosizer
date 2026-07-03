@@ -20,7 +20,9 @@ public class SavedProfile
 
     public string ModelName => Path.GetFileNameWithoutExtension(ModelPath);
 
-    public string ProfileFile => $"profiles/{Id:N}.json";
+    // File name only — ProfileLibraryService combines this with the configured profiles
+    // directory (see AppSettingsService) to get the full path.
+    public string ProfileFileName => $"{Id:N}.json";
 
     /// <summary>Short one-line summary for list display.</summary>
     public string Summary()

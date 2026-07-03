@@ -41,7 +41,18 @@ public class BenchmarkResult
 
     // Scored metrics (0–1 each)
     public double QualityScore { get; set; }
-    public double ToolSuccessRate { get; set; }  // agentic only
+    public double ToolSuccessRate { get; set; }  // agentic only, single-shot tool call
+
+    // Multi-turn tool loop correctness (agentic only; 1.0 when the profile defines no
+    // AgentLoopCases). Distinct from ToolSuccessRate: this grades whether the model can
+    // consume an injected tool result and chain the next call / produce a correct final
+    // answer, which a one-shot tool-call check can't see.
+    public double AgentLoopScore { get; set; } = 1.0;
+
+    // Effective tokens/sec across the whole multi-turn agent loop (wall-clock, including
+    // every round-trip), as opposed to GenerationRate which is a clean single-turn decode
+    // rate. This is the number that should track what a real tooling harness reports.
+    public double AgentLoopEffectiveTgRate { get; set; }
 
     // Fraction of accuracy prompts answered correctly (1.0 when the profile defines none).
     // Folded into QualityScore so degraded configs (aggressive KV quant, too few MoE

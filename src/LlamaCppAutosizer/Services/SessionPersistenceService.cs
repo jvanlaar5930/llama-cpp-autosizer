@@ -5,8 +5,10 @@ using Microsoft.Extensions.Logging;
 
 namespace LlamaCppAutosizer.Services;
 
-public class SessionPersistenceService(ILogger<SessionPersistenceService> logger)
+public class SessionPersistenceService(AppSettingsService appSettings, ILogger<SessionPersistenceService> logger)
 {
+    private string SessionsDir => appSettings.Current.SessionsDirectory;
+
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
         WriteIndented = true,
@@ -19,12 +21,12 @@ public class SessionPersistenceService(ILogger<SessionPersistenceService> logger
     {
         try
         {
-            var dir = Path.GetDirectoryName(session.SessionFile) ?? "sessions";
-            Directory.CreateDirectory(dir);
+            Directory.CreateDirectory(SessionsDir);
+            string path = Path.Combine(SessionsDir, session.SessionFileName);
 
-            await using var fs = new FileStream(session.SessionFile, FileMode.Create, FileAccess.Write);
+            await using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
             await JsonSerializer.SerializeAsync(fs, session, JsonOpts);
-            logger.LogDebug("Session saved to {File}", session.SessionFile);
+            logger.LogDebug("Session saved to {File}", path);
         }
         catch (Exception ex)
         {
@@ -46,8 +48,9 @@ public class SessionPersistenceService(ILogger<SessionPersistenceService> logger
         }
     }
 
-    public List<string> ListSessions(string directory = "sessions")
+    public List<string> ListSessions(string? directory = null)
     {
+        directory ??= SessionsDir;
         if (!Directory.Exists(directory)) return [];
         return Directory.GetFiles(directory, "*.json", SearchOption.TopDirectoryOnly)
                         .OrderByDescending(f => File.GetLastWriteTime(f))
@@ -58,9 +61,9 @@ public class SessionPersistenceService(ILogger<SessionPersistenceService> logger
     /// Loads every session in the directory and returns those that have at least one result.
     /// Failures are silently skipped.
     /// </summary>
-    public async Task<List<OptimizationSession>> LoadAllAsync(string directory = "sessions")
+    public async Task<List<OptimizationSession>> LoadAllAsync(string? directory = null)
     {
-        var files = ListSessions(directory);
+        var files = ListSessions(directory ?? SessionsDir);
         var results = new List<OptimizationSession>(files.Count);
 
         foreach (var file in files)

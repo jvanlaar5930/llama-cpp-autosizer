@@ -9,7 +9,8 @@ public record ScoringWeights(
     double PpSpeed,
     double TimeToFirstToken,
     double Quality,
-    double ToolSuccess
+    double ToolSuccess,
+    double AgentLoop = 0.0
 );
 
 public class ToolDefinition
@@ -36,6 +37,25 @@ public class AccuracyPrompt
     public string[] AcceptableAnswers { get; set; } = [];
 }
 
+// A full agent-style tool loop: initial prompt, N tool round-trips with a synthetic
+// (fabricated) tool result injected after each call, then a final free-text turn. Unlike
+// ToolBenchmarkCase (one shot, first call only) this exercises the parts of a real tooling
+// harness that a single-turn test can't see: whether the model can consume an injected tool
+// result and either chain the next call or synthesize a correct final answer, and whether
+// conversation-history reuse across turns behaves like it would in a real session.
+public class AgentLoopCase
+{
+    public string Prompt { get; set; } = "";
+    // Tool name expected at each successive round-trip; length determines how many
+    // tool-call turns are run before the final free-text turn.
+    public string[] ExpectedToolSequence { get; set; } = [];
+    // Fabricated tool output fed back for each step (same length as ExpectedToolSequence).
+    public string[] ToolResults { get; set; } = [];
+    // Substrings the final answer should contain (case-insensitive, any match). Empty means
+    // just check that a coherent non-tool-call answer was produced.
+    public string[] FinalAnswerContains { get; set; } = [];
+}
+
 public record class OptimizationProfile
 {
     public ProfileType Type { get; init; }
@@ -54,6 +74,10 @@ public record class OptimizationProfile
     public List<ToolBenchmarkCase> ToolBenchmarks { get; init; } = [];
     public List<AccuracyPrompt> AccuracyPrompts { get; init; } = [];
 
+    // Multi-turn tool-loop cases. Agentic-only — left empty by Chat() since chat mode
+    // never exercises tool calling.
+    public List<AgentLoopCase> AgentLoopCases { get; init; } = [];
+
     // Opt-in long-form generation used to surface degenerate repetition loops
     // ("is is is is...") that short benchmark prompts rarely run long enough to reach.
     public string? StressTestPrompt { get; init; } =
@@ -70,7 +94,7 @@ public record class OptimizationProfile
         Type = ProfileType.Chat,
         Name = "Chat",
         Description = "Low latency, responsive generation — ideal for interactive conversations",
-        Weights = new(TgSpeed: 0.35, PpSpeed: 0.10, TimeToFirstToken: 0.35, Quality: 0.20, ToolSuccess: 0.00),
+        Weights = new(TgSpeed: 0.35, PpSpeed: 0.10, TimeToFirstToken: 0.35, Quality: 0.20, ToolSuccess: 0.00, AgentLoop: 0.00),
         TargetContextSize = 8192,
         MaxGenerateTokens = 256,
         WarmupRuns = 2,
@@ -97,7 +121,7 @@ public record class OptimizationProfile
         Type = ProfileType.Agentic,
         Name = "Agentic",
         Description = "High throughput, reliable structured outputs — ideal for tool-calling agent loops",
-        Weights = new(TgSpeed: 0.15, PpSpeed: 0.25, TimeToFirstToken: 0.10, Quality: 0.20, ToolSuccess: 0.30),
+        Weights = new(TgSpeed: 0.10, PpSpeed: 0.20, TimeToFirstToken: 0.10, Quality: 0.15, ToolSuccess: 0.20, AgentLoop: 0.25),
         TargetContextSize = 32768,
         MaxGenerateTokens = 512,
         WarmupRuns = 1,
@@ -205,6 +229,42 @@ public record class OptimizationProfile
             },
         ],
         AccuracyPrompts = DefaultAccuracyPrompts(),
+        AgentLoopCases =
+        [
+            new()
+            {
+                Prompt = "Search the web for the current population of Tokyo, then tell me the number you found.",
+                ExpectedToolSequence = ["search_web"],
+                ToolResults =
+                [
+                    "{\"results\":[{\"title\":\"Tokyo population 2024\",\"snippet\":\"Tokyo's metropolitan population is approximately 14 million people as of 2024.\"}]}",
+                ],
+                FinalAnswerContains = ["14 million"],
+            },
+            new()
+            {
+                Prompt = "Read the file at /etc/hosts, then tell me how many non-empty lines it contains.",
+                ExpectedToolSequence = ["read_file"],
+                ToolResults =
+                [
+                    "{\"content\":\"127.0.0.1 localhost\\n::1 localhost\\n10.0.0.5 devbox\\n\"}",
+                ],
+                FinalAnswerContains = ["3"],
+            },
+            new()
+            {
+                Prompt = "Search the web for how to reverse a linked list in Python, then run the example you find " +
+                         "against the list [1, 2, 3] and tell me what it prints.",
+                ExpectedToolSequence = ["search_web", "run_code"],
+                ToolResults =
+                [
+                    "{\"results\":[{\"title\":\"Reverse a linked list - Python\",\"snippet\":" +
+                    "\"def reverse(head):\\n    prev = None\\n    while head:\\n        head.next, prev, head = prev, head, head.next\\n    return prev\"}]}",
+                    "{\"stdout\":\"[3, 2, 1]\"}",
+                ],
+                FinalAnswerContains = ["3, 2, 1", "[3, 2, 1]"],
+            },
+        ],
     };
 
     // Easy enough that any healthy config answers all of them; a config degraded by
@@ -244,13 +304,15 @@ public record class OptimizationProfile
         double ttftScore = NormalizeTtft(result.TimeToFirstTokenMs, worst: 5000, best: 200);
         double qualityScore = result.QualityScore;
         double toolScore = result.ToolSuccessRate;
+        double agentLoopScore = result.AgentLoopScore;
 
         return Math.Clamp(
             Weights.TgSpeed * tgScore
           + Weights.PpSpeed * ppScore
           + Weights.TimeToFirstToken * ttftScore
           + Weights.Quality * qualityScore
-          + Weights.ToolSuccess * toolScore,
+          + Weights.ToolSuccess * toolScore
+          + Weights.AgentLoop * agentLoopScore,
             0, 1);
     }
 

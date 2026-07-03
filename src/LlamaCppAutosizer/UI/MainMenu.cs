@@ -11,14 +11,14 @@ public class MainMenu(
     TurboQuantService turboQuant,
     SessionPersistenceService persistence,
     ProfileLibraryService profileLibrary,
-    ProfileMenu profileMenu)
+    ProfileMenu profileMenu,
+    AppSettingsService appSettings,
+    AppSettingsMenu settingsMenu)
 {
     // -------------------------------------------------------------------------
     // Configuration (loaded once, persisted to disk)
     // -------------------------------------------------------------------------
 
-    private string _serverExecutable = "llama-server";
-    private string _modelFolder = "";
     private string _modelPath = "";
     private OptimizationProfile _profile = OptimizationProfile.Chat();
     private LlamaSettings _manualSettings = new();
@@ -43,15 +43,14 @@ public class MainMenu(
             string? choice = MenuHelper.Select(
                 "[bold yellow]llama.cpp Auto-Sizer[/] — Main Menu",
                 [
-                    "1. Select Model Folder  (auto-discover .gguf)",
-                    "2. Choose Profile  (Chat / Agentic)",
-                    "3. Set llama-server Path",
-                    "4. Detect Hardware",
-                    "5. Run Auto-Optimization",
-                    "6. Edit Settings Manually",
-                    "7. Named Profiles  (run / manage)",
-                    "8. TurboQuant Options",
-                    "9. View / Load Sessions",
+                    "1. Choose Profile  (Chat / Agentic)",
+                    "2. Detect Hardware",
+                    "3. Run Auto-Optimization",
+                    "4. Edit llama.cpp Settings Manually",
+                    "5. Named Profiles  (run / manage)",
+                    "6. TurboQuant Options",
+                    "7. View / Load Sessions",
+                    "8. Settings  (model folder, server path, storage)",
                     "H. Historical Benchmark Comparison",
                     "0. Exit",
                 ],
@@ -64,15 +63,14 @@ public class MainMenu(
             {
                 switch (choice[0])
                 {
-                    case '1': await SelectModelAsync(ct); break;
-                    case '2': ChooseProfile(); break;
-                    case '3': SetServerPath(); break;
-                    case '4': await DetectHardwareAsync(ct); break;
-                    case '5': await RunOptimizationAsync(ct); break;
-                    case '6': EditSettingsManually(); break;
-                    case '7': await profileMenu.RunAsync(_serverExecutable, ct); break;
-                    case '8': await TurboQuantMenuAsync(ct); break;
-                    case '9': await ViewSessionsAsync(ct); break;
+                    case '1': ChooseProfile(); break;
+                    case '2': await DetectHardwareAsync(ct); break;
+                    case '3': await RunOptimizationAsync(ct); break;
+                    case '4': EditSettingsManually(); break;
+                    case '5': await profileMenu.RunAsync(appSettings.Current.ServerExecutable, ct); break;
+                    case '6': await TurboQuantMenuAsync(ct); break;
+                    case '7': await ViewSessionsAsync(ct); break;
+                    case '8': settingsMenu.Run(); break;
                     case 'H': case 'h': await HistoricalComparisonAsync(ct); break;
                 }
                 SaveConfig();
@@ -94,30 +92,56 @@ public class MainMenu(
     // Menu handlers
     // -------------------------------------------------------------------------
 
-    private async Task SelectModelAsync(CancellationToken ct)
+    // Scans the model folder configured in Settings and lets the user pick a .gguf file.
+    // Returns false if the user backs out without selecting anything (e.g. no folder
+    // configured and no manual path given). Called from RunOptimizationAsync when the
+    // user doesn't start from an existing named profile.
+    private async Task<bool> SelectModelFromConfiguredFolderAsync(CancellationToken ct)
     {
         AnsiConsole.WriteLine();
         AnsiConsole.Write(new Rule("[bold]Select Model[/]").RuleStyle("cyan"));
 
-        // ── 1. Pick / confirm folder ─────────────────────────────────────────
-        string defaultFolder = _modelFolder.Length > 0 && Directory.Exists(_modelFolder)
-            ? _modelFolder
-            : (!string.IsNullOrEmpty(_modelPath)
-                ? Path.GetDirectoryName(_modelPath) ?? Directory.GetCurrentDirectory()
-                : Directory.GetCurrentDirectory());
+        string folder = appSettings.Current.ModelFolder;
+        if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
+        {
+            AnsiConsole.MarkupLine(
+                "[yellow]No valid model folder configured.[/] Set one in [cyan]Settings[/] (menu option 8), " +
+                "or enter a folder now.");
+            string manualFolder = AnsiConsole.Prompt(
+                new TextPrompt<string>(
+                    "[grey]Folder to scan for[/] [cyan].gguf[/] [grey]files (empty to enter a file path directly):[/]")
+                    .AllowEmpty());
 
-        string folder = AnsiConsole.Prompt(
-            new TextPrompt<string>("[grey]Folder to scan for[/] [cyan].gguf[/] [grey]files:[/]")
-                .DefaultValue(defaultFolder)
-                .Validate(p => Directory.Exists(p)
-                    ? ValidationResult.Success()
-                    : ValidationResult.Error("Folder not found")));
+            if (string.IsNullOrWhiteSpace(manualFolder))
+            {
+                string manualPath = AnsiConsole.Prompt(
+                    new TextPrompt<string>("Full path to .gguf file:")
+                        .Validate(p => File.Exists(p)
+                            ? ValidationResult.Success()
+                            : ValidationResult.Error("File not found")));
+                SetModel(manualPath);
+                return true;
+            }
 
-        _modelFolder = folder;
+            if (!Directory.Exists(manualFolder))
+            {
+                AnsiConsole.MarkupLine("[red]Folder not found.[/]");
+                AnsiConsole.WriteLine("Press any key...");
+                Console.ReadKey(intercept: true);
+                return false;
+            }
 
-        bool recursive = AnsiConsole.Confirm("Search sub-folders?", false);
+            folder = manualFolder;
+            if (AnsiConsole.Confirm("Save this as the default model folder in Settings?", true))
+            {
+                appSettings.Current.ModelFolder = folder;
+                appSettings.Save();
+            }
+        }
 
-        // ── 2. Discover models ───────────────────────────────────────────────
+        bool recursive = AnsiConsole.Confirm($"Scan [cyan]{Markup.Escape(folder)}[/] — include sub-folders?", false);
+
+        // ── Discover models ─────────────────────────────────────────────────
         List<(string Path, long SizeMb)> models = [];
         await AnsiConsole.Status()
             .StartAsync("Scanning for .gguf files...", async _ =>
@@ -141,10 +165,10 @@ public class MainMenu(
                         ? ValidationResult.Success()
                         : ValidationResult.Error("File not found")));
             SetModel(manual);
-            return;
+            return true;
         }
 
-        // ── 3. Display discovered models ─────────────────────────────────────
+        // ── Display discovered models ────────────────────────────────────────
         AnsiConsole.WriteLine();
         BenchmarkDisplay.RenderModelList(models);
         AnsiConsole.WriteLine();
@@ -155,11 +179,6 @@ public class MainMenu(
                 $"{i + 1,3}. {Markup.Escape(Path.GetFileName(m.Path))}  [[{m.SizeMb:N0} MB]]")
             .Append("── Enter path manually ──")
             .ToList();
-
-        // Pre-select currently active model if in this folder
-        int defaultIdx = models.FindIndex(m =>
-            m.Path.Equals(_modelPath, StringComparison.OrdinalIgnoreCase));
-        string defaultChoice = defaultIdx >= 0 ? choices[defaultIdx] : choices[0];
 
         string selected = AnsiConsole.Prompt(
             new SelectionPrompt<string>()
@@ -177,14 +196,17 @@ public class MainMenu(
                         ? ValidationResult.Success()
                         : ValidationResult.Error("File not found")));
             SetModel(manual);
+            return true;
         }
-        else
+
+        // Parse index from "  3. filename.gguf  [4,321 MB]"
+        int dot = selected.IndexOf('.');
+        if (dot > 0 && int.TryParse(selected[..dot].Trim(), out int idx) && idx >= 1 && idx <= models.Count)
         {
-            // Parse index from "  3. filename.gguf  [4,321 MB]"
-            int dot = selected.IndexOf('.');
-            if (dot > 0 && int.TryParse(selected[..dot].Trim(), out int idx) && idx >= 1 && idx <= models.Count)
-                SetModel(models[idx - 1].Path);
+            SetModel(models[idx - 1].Path);
+            return true;
         }
+        return false;
     }
 
     private void SetModel(string path)
@@ -194,8 +216,6 @@ public class MainMenu(
         AnsiConsole.MarkupLine($"[green]Model:[/] {Markup.Escape(Path.GetFileName(_modelPath))}  " +
             $"[grey]({new FileInfo(_modelPath).Length / (1024 * 1024):N0} MB)[/]");
         AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[grey]Press any key to return to menu...[/]");
-        Console.ReadKey(intercept: true);
     }
 
     private void ChooseProfile()
@@ -250,17 +270,6 @@ public class MainMenu(
                     ? ValidationResult.Success()
                     : ValidationResult.Error("Must be 0.0–1.0")));
 
-    private void SetServerPath()
-    {
-        _serverExecutable = AnsiConsole.Prompt(
-            new TextPrompt<string>("Path to [cyan]llama-server[/] executable:")
-                .DefaultValue(_serverExecutable));
-        AnsiConsole.MarkupLine($"[green]Server:[/] {Markup.Escape(_serverExecutable)}");
-        AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[grey]Press any key to return to menu...[/]");
-        Console.ReadKey(intercept: true);
-    }
-
     private async Task DetectHardwareAsync(CancellationToken ct)
     {
         _hardware = await AnsiConsole.Status()
@@ -280,51 +289,61 @@ public class MainMenu(
     {
         if (!ValidateReadyToRun()) return;
 
+        // ── Step 1: start from an existing named profile (model + settings both come from
+        // it), or fall back to scanning the model folder configured in Settings ──────────
+        var savedProfiles = await profileLibrary.ListProfilesAsync();
+        SavedProfile? sourceProfile = null;
+
+        if (savedProfiles.Count > 0 &&
+            AnsiConsole.Confirm("Start from an existing named profile?", false))
+        {
+            var profileChoices = savedProfiles
+                .Select(p =>
+                {
+                    string score = p.BenchmarkScore.HasValue ? $"  score={p.BenchmarkScore:F3}" : "";
+                    string tg    = p.BenchmarkTgRate.HasValue ? $"  TG={p.BenchmarkTgRate:F0}t/s" : "";
+                    return $"[cyan]{Markup.Escape(p.Name)}[/]{score}{tg}  [grey]({Markup.Escape(p.ModelName)})[/]";
+                })
+                .ToList();
+
+            string? picked = MenuHelper.Select("Select starting profile:", profileChoices);
+            if (picked is not null)
+            {
+                int idx = profileChoices.IndexOf(picked);
+                sourceProfile = savedProfiles[idx];
+            }
+        }
+
+        if (sourceProfile is not null)
+        {
+            if (!File.Exists(sourceProfile.ModelPath))
+            {
+                AnsiConsole.MarkupLine(
+                    $"[red]Model file for this profile no longer exists:[/] {Markup.Escape(sourceProfile.ModelPath)}");
+                AnsiConsole.WriteLine("Press any key...");
+                Console.ReadKey(intercept: true);
+                return;
+            }
+            _modelPath = sourceProfile.ModelPath;
+            AnsiConsole.MarkupLine($"[grey]Model (from profile):[/] {Markup.Escape(Path.GetFileName(_modelPath))}");
+        }
+        else if (!await SelectModelFromConfiguredFolderAsync(ct))
+        {
+            return;
+        }
+
         _hardware ??= await AnsiConsole.Status()
             .StartAsync("Detecting hardware...", _ => hwService.DetectAsync());
 
         BenchmarkDisplay.RenderHardwareInfo(_hardware);
         AnsiConsole.WriteLine();
 
-        // ── Starting settings: auto-detect or load an existing profile ──────────
         LlamaSettings initialSettings;
-        var savedProfiles = await profileLibrary.ListProfilesAsync();
-
-        // Show profiles for the current model first; fall back to all if none match.
-        var relevantProfiles = savedProfiles
-            .Where(p => string.Equals(p.ModelPath, _modelPath, StringComparison.OrdinalIgnoreCase))
-            .ToList();
-        var choicePool = relevantProfiles.Count > 0 ? relevantProfiles : savedProfiles;
-
-        if (choicePool.Count > 0 &&
-            AnsiConsole.Confirm("Start from an existing named profile?", false))
+        if (sourceProfile is not null)
         {
-            var profileChoices = choicePool
-                .Select(p =>
-                {
-                    string score = p.BenchmarkScore.HasValue ? $"  score={p.BenchmarkScore:F3}" : "";
-                    string tg    = p.BenchmarkTgRate.HasValue ? $"  TG={p.BenchmarkTgRate:F0}t/s" : "";
-                    string model = !string.Equals(p.ModelPath, _modelPath, StringComparison.OrdinalIgnoreCase)
-                        ? $"  [grey]({Markup.Escape(p.ModelName)})[/]" : "";
-                    return $"[cyan]{Markup.Escape(p.Name)}[/]{score}{tg}{model}";
-                })
-                .Prepend("[grey]── Auto-detect from hardware ──[/]")
-                .ToList();
-
-            string? picked = MenuHelper.Select("Select starting profile:", profileChoices);
-
-            if (picked is null || picked.StartsWith("[grey]──"))
-            {
-                initialSettings = OptimizerService.BuildInitialSettings(_modelPath, _profile, _hardware);
-            }
-            else
-            {
-                int idx = profileChoices.IndexOf(picked) - 1; // -1 because of the prepended header
-                var sourceProfile = choicePool[idx];
-                initialSettings = sourceProfile.Settings.Clone();
-                AnsiConsole.MarkupLine($"[grey]Starting from profile:[/] [cyan]{Markup.Escape(sourceProfile.Name)}[/]");
-                AnsiConsole.WriteLine();
-            }
+            initialSettings = sourceProfile.Settings.Clone();
+            AnsiConsole.MarkupLine($"[grey]Starting from profile:[/] [cyan]{Markup.Escape(sourceProfile.Name)}[/]");
+            AnsiConsole.WriteLine();
         }
         else
         {
@@ -416,7 +435,7 @@ public class MainMenu(
 
         // Optimizer writes iterations into session directly; we only read them here for the UI.
         var iterations = optimizer.OptimizeAsync(
-            _serverExecutable, _modelPath, initialSettings, _profile, session, opts, cts.Token);
+            appSettings.Current.ServerExecutable, _modelPath, initialSettings, _profile, session, opts, cts.Token);
 
         AnsiConsole.Write(new Rule("[grey dim]llama-server log (scroll up for history) — L: toggle full/truncated[/]").RuleStyle("grey dim"));
 
@@ -579,7 +598,7 @@ public class MainMenu(
         llamaServer.SetLogHandler(null);
 
         AnsiConsole.WriteLine();
-        BenchmarkDisplay.RenderFinalResults(session, _serverExecutable);
+        BenchmarkDisplay.RenderFinalResults(session, appSettings.Current.ServerExecutable);
 
         if (AnsiConsole.Confirm("\nExport results to file?", true))
         {
@@ -682,7 +701,7 @@ public class MainMenu(
 
         await profileLibrary.SaveAsync(profile);
         AnsiConsole.MarkupLine($"[green]Profile saved:[/] {Markup.Escape(profile.Name)}");
-        AnsiConsole.MarkupLine("[grey]Access it any time from menu option 7.[/]");
+        AnsiConsole.MarkupLine("[grey]Access it any time from menu option 5.[/]");
     }
 
     private void ConfigureTurboQuantCacheTypes()
@@ -870,7 +889,7 @@ public class MainMenu(
         }
 
         AnsiConsole.WriteLine();
-        BenchmarkDisplay.RenderFinalResults(session, _serverExecutable);
+        BenchmarkDisplay.RenderFinalResults(session, appSettings.Current.ServerExecutable);
 
         if (session.BestSettings is not null &&
             AnsiConsole.Confirm("Apply best settings from this session?", true))
@@ -961,17 +980,10 @@ public class MainMenu(
 
     private bool ValidateReadyToRun()
     {
-        var errors = new List<string>();
-        if (string.IsNullOrEmpty(_modelPath) || !File.Exists(_modelPath))
-            errors.Add("No valid model selected (menu option 1)");
-        if (string.IsNullOrEmpty(_serverExecutable))
-            errors.Add("llama-server path not set (menu option 3)");
-
-        if (errors.Count == 0) return true;
+        if (!string.IsNullOrEmpty(appSettings.Current.ServerExecutable)) return true;
 
         AnsiConsole.MarkupLine("[red]Cannot start — please fix:[/]");
-        foreach (var e in errors)
-            AnsiConsole.MarkupLine($"  [yellow]• {e}[/]");
+        AnsiConsole.MarkupLine("  [yellow]• llama-server path not set (Settings menu, option 8)[/]");
         AnsiConsole.WriteLine("Press any key...");
         Console.ReadKey(intercept: true);
         return false;
@@ -989,7 +1001,7 @@ public class MainMenu(
 
         // Show current session state if anything is configured
         bool hasModel = !string.IsNullOrEmpty(_modelPath) && File.Exists(_modelPath);
-        bool hasServer = !string.IsNullOrEmpty(_serverExecutable);
+        bool hasServer = !string.IsNullOrEmpty(appSettings.Current.ServerExecutable);
 
         if (hasModel || hasServer || _manualSettings.GpuLayers != new LlamaSettings().GpuLayers)
         {
@@ -1010,7 +1022,7 @@ public class MainMenu(
             : "[grey]no model selected[/]";
 
         string serverCell = hasServer
-            ? $"[deepskyblue1]{Markup.Escape(Path.GetFileName(_serverExecutable))}[/]"
+            ? $"[deepskyblue1]{Markup.Escape(Path.GetFileName(appSettings.Current.ServerExecutable))}[/]"
             : "[grey]not set[/]";
 
         // ── Settings summary row ──────────────────────────────────────────────
@@ -1061,8 +1073,24 @@ public class MainMenu(
             var doc = System.Text.Json.JsonDocument.Parse(json);
             var root = doc.RootElement;
 
-            if (root.TryGetProperty("serverExecutable", out var se)) _serverExecutable = se.GetString() ?? _serverExecutable;
-            if (root.TryGetProperty("modelFolder", out var mf)) _modelFolder = mf.GetString() ?? "";
+            // One-time migration: this file used to also hold serverExecutable/modelFolder,
+            // which now live in AppSettingsService's central config (see Settings menu).
+            bool migrated = false;
+            if (string.IsNullOrWhiteSpace(appSettings.Current.ModelFolder) &&
+                root.TryGetProperty("modelFolder", out var mf) && mf.GetString() is { Length: > 0 } mfVal)
+            {
+                appSettings.Current.ModelFolder = mfVal;
+                migrated = true;
+            }
+            if (appSettings.Current.ServerExecutable == "llama-server" &&
+                root.TryGetProperty("serverExecutable", out var se) &&
+                se.GetString() is { Length: > 0 } seVal && seVal != "llama-server")
+            {
+                appSettings.Current.ServerExecutable = seVal;
+                migrated = true;
+            }
+            if (migrated) appSettings.Save();
+
             if (root.TryGetProperty("modelPath", out var mp)) _modelPath = mp.GetString() ?? "";
             if (root.TryGetProperty("profile", out var pf))
             {
@@ -1080,8 +1108,6 @@ public class MainMenu(
         {
             var json = System.Text.Json.JsonSerializer.Serialize(new
             {
-                serverExecutable = _serverExecutable,
-                modelFolder = _modelFolder,
                 modelPath = _modelPath,
                 profile = _profile.Name,
             }, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });

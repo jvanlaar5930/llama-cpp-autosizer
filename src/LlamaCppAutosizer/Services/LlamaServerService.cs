@@ -47,7 +47,12 @@ public class CompletionResponse
 public class ChatMessage
 {
     [JsonPropertyName("role")] public string Role { get; init; } = "user";
-    [JsonPropertyName("content")] public string Content { get; init; } = "";
+    [JsonPropertyName("content")] public string? Content { get; init; } = "";
+
+    // Set on an assistant message being replayed back into the conversation after it
+    // requested a tool call, and on the matching "tool" role reply (via ToolCallId).
+    [JsonPropertyName("tool_calls")] public List<ToolCall>? ToolCalls { get; init; }
+    [JsonPropertyName("tool_call_id")] public string? ToolCallId { get; init; }
 }
 
 public class ChatCompletionRequest

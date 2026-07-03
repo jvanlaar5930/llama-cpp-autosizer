@@ -27,7 +27,7 @@ public class ProfileMenu(
             if (profiles.Count == 0)
             {
                 AnsiConsole.MarkupLine("[grey]No saved profiles yet.[/]");
-                AnsiConsole.MarkupLine("[grey]Run an optimization (option 5) or edit settings manually (option 6)[/]");
+                AnsiConsole.MarkupLine("[grey]Run an optimization (option 3) or edit settings manually (option 4)[/]");
                 AnsiConsole.MarkupLine("[grey]and choose 'Save as named profile' when prompted.[/]");
                 AnsiConsole.WriteLine();
                 AnsiConsole.WriteLine("Press any key to go back...");

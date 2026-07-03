@@ -116,8 +116,10 @@ public class OptimizationSession
     public string? TurboQuantModelPath { get; set; }
     public BenchmarkResult? TurboQuantResult { get; set; }
 
-    public string SessionFile =>
-        $"sessions/{ModelName}_{Profile}_{StartedAt:yyyyMMdd_HHmmss}.json";
+    // File name only — SessionPersistenceService combines this with the configured
+    // sessions directory (see AppSettingsService) to get the full path.
+    public string SessionFileName =>
+        $"{ModelName}_{Profile}_{StartedAt:yyyyMMdd_HHmmss}.json";
 
     public void AddIteration(OptimizationIteration iter)
     {
