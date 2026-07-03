@@ -14,15 +14,20 @@ public static class BenchmarkDisplay
     {
         if (session.Iterations.Count == 0) return;
 
-        var table = BuildIterationTable();
+        // Tool/agent-loop tok/s columns only earn their space when the profile actually ran
+        // those benchmarks — Chat profile sessions never populate them.
+        bool showAgenticRates = session.Profile == ProfileType.Agentic &&
+            session.Iterations.Any(i => i.Result.ToolCallEffectiveTgRate > 0 || i.Result.AgentLoopEffectiveTgRate > 0);
+
+        var table = BuildIterationTable(showAgenticRates);
         foreach (var iter in session.Iterations)
-            AddIterationRow(table, iter);
+            AddIterationRow(table, iter, showAgenticRates);
 
         AnsiConsole.Write(new Rule("[bold]Optimization History[/]").RuleStyle("grey"));
         AnsiConsole.Write(table);
     }
 
-    private static Table BuildIterationTable()
+    private static Table BuildIterationTable(bool showAgenticRates)
     {
         var t = new Table()
             .Border(TableBorder.Rounded)
@@ -32,7 +37,12 @@ public static class BenchmarkDisplay
         t.AddColumn(new TableColumn("[grey]#[/]").RightAligned());
         t.AddColumn("[grey]Change[/]");
         t.AddColumn(new TableColumn("[grey]PP t/s[/]").RightAligned());
-        t.AddColumn(new TableColumn("[grey]TG t/s[/]").RightAligned());
+        t.AddColumn(new TableColumn("[grey]Chat TG t/s[/]").RightAligned());
+        if (showAgenticRates)
+        {
+            t.AddColumn(new TableColumn("[grey]Tool TG t/s[/]").RightAligned());
+            t.AddColumn(new TableColumn("[grey]Loop TG t/s[/]").RightAligned());
+        }
         t.AddColumn(new TableColumn("[grey]TTFT ms[/]").RightAligned());
         t.AddColumn(new TableColumn("[grey]Score[/]").RightAligned());
         t.AddColumn("[grey]Source[/]");
@@ -40,7 +50,7 @@ public static class BenchmarkDisplay
         return t;
     }
 
-    private static void AddIterationRow(Table table, OptimizationIteration iter)
+    private static void AddIterationRow(Table table, OptimizationIteration iter, bool showAgenticRates)
     {
         var r = iter.Result;
         string num = iter.IsBestSoFar
@@ -74,15 +84,26 @@ public static class BenchmarkDisplay
                 ? Markup.Escape(iter.AppliedChange.Reasoning)
                 : Markup.Escape(iter.StatusMessage ?? "");
 
-        table.AddRow(
+        var cells = new List<string>
+        {
             num,
             change,
             wasSkipped ? "[grey]—[/]" : $"{r.PromptProcessingRate,7:F1}",
             wasSkipped ? "[grey]—[/]" : $"{r.GenerationRate,6:F1}",
-            wasSkipped ? "[grey]—[/]" : $"{r.TimeToFirstTokenMs,6:F0}",
-            score,
-            source,
-            notes);
+        };
+
+        if (showAgenticRates)
+        {
+            cells.Add(wasSkipped || r.ToolCallEffectiveTgRate <= 0 ? "[grey]—[/]" : $"{r.ToolCallEffectiveTgRate,6:F1}");
+            cells.Add(wasSkipped || r.AgentLoopEffectiveTgRate <= 0 ? "[grey]—[/]" : $"{r.AgentLoopEffectiveTgRate,6:F1}");
+        }
+
+        cells.Add(wasSkipped ? "[grey]—[/]" : $"{r.TimeToFirstTokenMs,6:F0}");
+        cells.Add(score);
+        cells.Add(source);
+        cells.Add(notes);
+
+        table.AddRow(cells.ToArray());
     }
 
     // -------------------------------------------------------------------------
@@ -105,22 +126,33 @@ public static class BenchmarkDisplay
         var s = session.BestSettings!;
 
         // Metrics panel
+        var metricsTable = new Table()
+            .Border(TableBorder.None)
+            .HideHeaders()
+            .AddColumn("").AddColumn("")
+            .AddRow("[grey]Model[/]", $"[cyan]{session.ModelName}[/]")
+            .AddRow("[grey]Profile[/]", $"[cyan]{session.Profile}[/]")
+            .AddRow("[grey]Iterations[/]", $"[cyan]{session.Iterations.Count}[/]")
+            .AddRow("[grey]Best score[/]", $"[bold green]{r.CompositeScore:F3}[/]")
+            .AddRow("[grey]Context[/]", $"[cyan]{s.ContextSize:N0} tokens[/]")
+            .AddRow("[grey]GPU layers[/]", $"[cyan]{(s.GpuLayers == -1 ? "all" : s.GpuLayers)}[/]")
+            .AddRow("[grey]PP speed[/]", $"[cyan]{r.PromptProcessingRate:F1} t/s[/]")
+            .AddRow("[grey]Chat TG speed[/]", $"[cyan]{r.GenerationRate:F1} t/s[/]");
+
+        // Tooling/agent-loop rates only exist for the Agentic profile, and only once those
+        // benchmarks actually ran — they track a materially different throughput profile than
+        // plain chat generation (structured/short completions, multi-turn KV-cache reuse).
+        if (r.ToolCallEffectiveTgRate > 0)
+            metricsTable.AddRow("[grey]Tooling TG speed[/]", $"[cyan]{r.ToolCallEffectiveTgRate:F1} t/s[/]");
+        if (r.AgentLoopEffectiveTgRate > 0)
+            metricsTable.AddRow("[grey]Agent-loop TG speed[/]", $"[cyan]{r.AgentLoopEffectiveTgRate:F1} t/s[/]");
+
+        metricsTable
+            .AddRow("[grey]TTFT[/]", $"[cyan]{r.TimeToFirstTokenMs:F0} ms[/]")
+            .AddRow("[grey]Completion[/]", $"[grey]{Markup.Escape(session.CompletionReason ?? "")}[/]");
+
         AnsiConsole.Write(
-            new Panel(
-                new Table()
-                    .Border(TableBorder.None)
-                    .HideHeaders()
-                    .AddColumn("").AddColumn("")
-                    .AddRow("[grey]Model[/]", $"[cyan]{session.ModelName}[/]")
-                    .AddRow("[grey]Profile[/]", $"[cyan]{session.Profile}[/]")
-                    .AddRow("[grey]Iterations[/]", $"[cyan]{session.Iterations.Count}[/]")
-                    .AddRow("[grey]Best score[/]", $"[bold green]{r.CompositeScore:F3}[/]")
-                    .AddRow("[grey]Context[/]", $"[cyan]{s.ContextSize:N0} tokens[/]")
-                    .AddRow("[grey]GPU layers[/]", $"[cyan]{(s.GpuLayers == -1 ? "all" : s.GpuLayers)}[/]")
-                    .AddRow("[grey]PP speed[/]", $"[cyan]{r.PromptProcessingRate:F1} t/s[/]")
-                    .AddRow("[grey]TG speed[/]", $"[cyan]{r.GenerationRate:F1} t/s[/]")
-                    .AddRow("[grey]TTFT[/]", $"[cyan]{r.TimeToFirstTokenMs:F0} ms[/]")
-                    .AddRow("[grey]Completion[/]", $"[grey]{Markup.Escape(session.CompletionReason ?? "")}[/]"))
+            new Panel(metricsTable)
             {
                 Header = new PanelHeader("[bold]Results Summary[/]"),
                 Border = BoxBorder.Rounded,
@@ -285,6 +317,9 @@ public static class BenchmarkDisplay
             AnsiConsole.WriteLine();
             AnsiConsole.Write(new Rule($"[bold]{group.Key} Profile[/]").RuleStyle("yellow"));
 
+            bool showAgenticRates = group.Key == ProfileType.Agentic &&
+                group.Any(s => s.BestResult!.ToolCallEffectiveTgRate > 0 || s.BestResult!.AgentLoopEffectiveTgRate > 0);
+
             var table = new Table()
                 .Border(TableBorder.Rounded)
                 .BorderColor(Color.Grey);
@@ -293,7 +328,12 @@ public static class BenchmarkDisplay
             table.AddColumn("[grey]Model[/]");
             table.AddColumn(new TableColumn("[grey]Score[/]").RightAligned());
             table.AddColumn(new TableColumn("[grey]PP t/s[/]").RightAligned());
-            table.AddColumn(new TableColumn("[grey]TG t/s[/]").RightAligned());
+            table.AddColumn(new TableColumn("[grey]Chat TG t/s[/]").RightAligned());
+            if (showAgenticRates)
+            {
+                table.AddColumn(new TableColumn("[grey]Tool TG t/s[/]").RightAligned());
+                table.AddColumn(new TableColumn("[grey]Loop TG t/s[/]").RightAligned());
+            }
             table.AddColumn(new TableColumn("[grey]TTFT ms[/]").RightAligned());
             table.AddColumn(new TableColumn("[grey]Iters[/]").RightAligned());
             table.AddColumn("[grey]Key Settings[/]");
@@ -328,16 +368,27 @@ public static class BenchmarkDisplay
                     $"[grey]ctx={st.ContextSize} ngl={st.GpuLayers} fa={st.FlashAttention} " +
                     $"kv={st.CacheTypeK ?? "f16"}[/]";
 
-                table.AddRow(
+                var rowCells = new List<string>
+                {
                     rankCell,
                     modelCell,
                     scoreCell,
                     $"{r.PromptProcessingRate,7:F1}",
                     $"{r.GenerationRate,6:F1}",
-                    $"{r.TimeToFirstTokenMs,6:F0}",
-                    s.Iterations.Count.ToString(),
-                    settingsCell,
-                    s.StartedAt.ToString("MM-dd HH:mm"));
+                };
+
+                if (showAgenticRates)
+                {
+                    rowCells.Add(r.ToolCallEffectiveTgRate > 0 ? $"{r.ToolCallEffectiveTgRate,6:F1}" : "[grey]—[/]");
+                    rowCells.Add(r.AgentLoopEffectiveTgRate > 0 ? $"{r.AgentLoopEffectiveTgRate,6:F1}" : "[grey]—[/]");
+                }
+
+                rowCells.Add($"{r.TimeToFirstTokenMs,6:F0}");
+                rowCells.Add(s.Iterations.Count.ToString());
+                rowCells.Add(settingsCell);
+                rowCells.Add(s.StartedAt.ToString("MM-dd HH:mm"));
+
+                table.AddRow(rowCells.ToArray());
 
                 rank++;
             }

@@ -43,6 +43,12 @@ public class BenchmarkResult
     public double QualityScore { get; set; }
     public double ToolSuccessRate { get; set; }  // agentic only, single-shot tool call
 
+    // Effective tokens/sec across the single-shot tool-call benchmark calls (agentic only).
+    // Kept separate from GenerationRate (the plain-prompt "chat" decode rate) because tool-call
+    // requests carry a schema/tools payload and typically produce short, structured completions
+    // — their throughput profile doesn't track plain chat generation.
+    public double ToolCallEffectiveTgRate { get; set; }
+
     // Multi-turn tool loop correctness (agentic only; 1.0 when the profile defines no
     // AgentLoopCases). Distinct from ToolSuccessRate: this grades whether the model can
     // consume an injected tool result and chain the next call / produce a correct final

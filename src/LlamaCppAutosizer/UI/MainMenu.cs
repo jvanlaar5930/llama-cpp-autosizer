@@ -139,7 +139,7 @@ public class MainMenu(
             }
         }
 
-        bool recursive = AnsiConsole.Confirm($"Scan [cyan]{Markup.Escape(folder)}[/] — include sub-folders?", false);
+        bool recursive = AnsiConsole.Confirm($"Scan [cyan]{Markup.Escape(folder)}[/] — include sub-folders?", true);
 
         // ── Discover models ─────────────────────────────────────────────────
         List<(string Path, long SizeMb)> models = [];
@@ -433,9 +433,16 @@ public class MainMenu(
         var logQueue = new System.Collections.Concurrent.ConcurrentQueue<string>();
         llamaServer.SetLogHandler(logQueue.Enqueue);
 
+        // Updated from OptimizerService/BenchmarkService as they move through phases (hardware
+        // detection, server start, which benchmark prompt/case is running, LLM recommendation
+        // calls, etc.) so the waiting spinner below always says what's actually happening
+        // instead of a bare "Working…".
+        string currentPhase = "";
+
         // Optimizer writes iterations into session directly; we only read them here for the UI.
         var iterations = optimizer.OptimizeAsync(
-            appSettings.Current.ServerExecutable, _modelPath, initialSettings, _profile, session, opts, cts.Token);
+            appSettings.Current.ServerExecutable, _modelPath, initialSettings, _profile, session, opts,
+            onPhase: p => currentPhase = p, cts.Token);
 
         AnsiConsole.Write(new Rule("[grey dim]llama-server log (scroll up for history) — L: toggle full/truncated[/]").RuleStyle("grey dim"));
 
@@ -556,7 +563,9 @@ public class MainMenu(
                 // last completed iteration found so that info doesn't just vanish.
                 while (!moveNextTask.IsCompleted)
                 {
-                    string waitingLabel = iterDone == 0 ? "Preparing llama-server…" : "Working…";
+                    string waitingLabel = currentPhase.Length > 0
+                        ? Markup.Escape(ClipToWidth(currentPhase, 6))
+                        : iterDone == 0 ? "Preparing llama-server…" : "Working…";
                     var waitingLines = new List<string>();
                     if (lastIterStatus.Length > 0) waitingLines.Add(lastIterStatus);
                     if (lastIterSub.Length > 0) waitingLines.Add($"  [grey]{lastIterSub}[/]");
@@ -571,10 +580,15 @@ public class MainMenu(
 
                 iterDone++;
                 string bestMark = iter.IsBestSoFar ? "  [bold green]★ best[/]" : "";
+                string toolRate = iter.Result.ToolCallEffectiveTgRate > 0
+                    ? $"  Tool=[cyan]{iter.Result.ToolCallEffectiveTgRate:F1}t/s[/]" : "";
+                string loopRate = iter.Result.AgentLoopEffectiveTgRate > 0
+                    ? $"  Loop=[cyan]{iter.Result.AgentLoopEffectiveTgRate:F1}t/s[/]" : "";
                 lastIterStatus = $"[grey]iter {iter.Number}/{maxIter}[/]  " +
                              $"score=[green]{iter.Result.CompositeScore:F3}[/]  " +
                              $"TG=[cyan]{iter.Result.GenerationRate:F1}t/s[/]  " +
                              $"PP=[cyan]{iter.Result.PromptProcessingRate:F0}t/s[/]" +
+                             toolRate + loopRate +
                              bestMark;
                 lastIterSub = iter.StatusMessage is not null
                     ? Markup.Escape(ClipToWidth(iter.StatusMessage, 4))

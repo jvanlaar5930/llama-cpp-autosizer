@@ -16,7 +16,8 @@ public class BenchmarkService(
         string modelPath,
         OptimizationProfile profile,
         CancellationToken ct = default,
-        bool includeRepetitionStressTest = false)
+        bool includeRepetitionStressTest = false,
+        Action<string>? onPhase = null)
     {
         var result = new BenchmarkResult
         {
@@ -26,9 +27,15 @@ public class BenchmarkService(
         };
 
         // Warmup
+        int warmupTotal = Math.Min(profile.WarmupRuns, profile.WarmupPrompts.Count);
+        int warmupIdx = 0;
         logger.LogDebug("Running {N} warmup prompts", profile.WarmupRuns);
         foreach (var prompt in profile.WarmupPrompts.Take(profile.WarmupRuns))
         {
+            warmupIdx++;
+            onPhase?.Invoke(warmupTotal > 1
+                ? $"Warming up ({warmupIdx}/{warmupTotal})…"
+                : "Warming up…");
             try
             {
                 await server.CompleteAsync(new CompletionRequest
@@ -46,9 +53,13 @@ public class BenchmarkService(
 
         // Main benchmark runs
         var timings = new List<RunTimings>();
+        int promptTotal = profile.BenchmarkPrompts.Count;
+        int promptIdx = 0;
         foreach (var prompt in profile.BenchmarkPrompts)
         {
             ct.ThrowIfCancellationRequested();
+            promptIdx++;
+            onPhase?.Invoke($"Benchmarking prompt {promptIdx}/{promptTotal}…");
             var runTiming = await RunSinglePromptAsync(prompt, profile.MaxGenerateTokens, result, ct);
             if (runTiming is not null) timings.Add(runTiming);
         }
@@ -59,6 +70,7 @@ public class BenchmarkService(
         if (includeRepetitionStressTest && !string.IsNullOrWhiteSpace(profile.StressTestPrompt))
         {
             ct.ThrowIfCancellationRequested();
+            onPhase?.Invoke("Running repetition-loop stress test…");
             var stressTiming = await RunSinglePromptAsync(profile.StressTestPrompt, profile.StressTestMaxTokens, result, ct);
             if (stressTiming is not null) timings.Add(stressTiming);
         }
@@ -69,11 +81,15 @@ public class BenchmarkService(
         if (profile.Type == ProfileType.Agentic)
         {
             if (profile.ToolBenchmarks.Count > 0)
-                toolSuccessRate = await RunToolBenchmarksAsync(profile, result, ct);
+            {
+                var (toolScore, toolTgRate) = await RunToolBenchmarksAsync(profile, result, ct, onPhase);
+                toolSuccessRate = toolScore;
+                result.ToolCallEffectiveTgRate = toolTgRate;
+            }
 
             if (profile.AgentLoopCases.Count > 0)
             {
-                var (loopScore, effectiveTgRate) = await RunAgentLoopBenchmarksAsync(profile, ct);
+                var (loopScore, effectiveTgRate) = await RunAgentLoopBenchmarksAsync(profile, ct, onPhase);
                 agentLoopScore = loopScore;
                 result.AgentLoopEffectiveTgRate = effectiveTgRate;
             }
@@ -85,9 +101,11 @@ public class BenchmarkService(
         double accuracyScore = 1.0;
         if (profile.AccuracyPrompts.Count > 0)
         {
-            accuracyScore = await RunAccuracyPromptsAsync(profile, ct);
+            accuracyScore = await RunAccuracyPromptsAsync(profile, ct, onPhase);
         }
         result.AccuracyScore = accuracyScore;
+
+        onPhase?.Invoke("Scoring output quality…");
 
         // Aggregate. Rates are weighted by tokens/time (not averaged per-run) because a
         // run that generates very few tokens in a tiny amount of time reports an inflated
@@ -152,11 +170,14 @@ public class BenchmarkService(
         }
     }
 
-    private async Task<double> RunToolBenchmarksAsync(
-        OptimizationProfile profile, BenchmarkResult result, CancellationToken ct)
+    private async Task<(double score, double effectiveTgRate)> RunToolBenchmarksAsync(
+        OptimizationProfile profile, BenchmarkResult result, CancellationToken ct, Action<string>? onPhase = null)
     {
         double score = 0;
         int total = profile.ToolBenchmarks.Count;
+        int caseIdx = 0;
+        long totalTokens = 0;
+        double totalWallMs = 0;
 
         // Serialize tools in OpenAI format
         object? toolsPayload = null;
@@ -177,8 +198,11 @@ public class BenchmarkService(
         foreach (var benchCase in profile.ToolBenchmarks)
         {
             ct.ThrowIfCancellationRequested();
+            caseIdx++;
+            onPhase?.Invoke($"Testing tool calls ({caseIdx}/{total})…");
             try
             {
+                var sw = Stopwatch.StartNew();
                 var (response, _) = await server.ChatCompleteAsync(new ChatCompletionRequest
                 {
                     Messages = [new ChatMessage { Role = "user", Content = benchCase.Prompt }],
@@ -186,6 +210,8 @@ public class BenchmarkService(
                     MaxTokens = 512,
                     Temperature = 0.1f,
                 }, ct);
+                totalWallMs += sw.Elapsed.TotalMilliseconds;
+                totalTokens += response.Usage?.CompletionTokens ?? 0;
 
                 double caseScore = ScoreToolCall(response, benchCase, profile);
                 score += caseScore;
@@ -198,7 +224,8 @@ public class BenchmarkService(
             }
         }
 
-        return total > 0 ? score / total : 1.0;
+        double effectiveTgRate = totalWallMs > 0 ? totalTokens / totalWallMs * 1000.0 : 0.0;
+        return (total > 0 ? score / total : 1.0, effectiveTgRate);
     }
 
     // Graded tool-call correctness. Every prompt in ToolBenchmarks clearly requires a tool,
@@ -263,7 +290,7 @@ public class BenchmarkService(
     // server's own slot-based KV cache reuse kicks in the same way it would in a real
     // harness session, instead of every turn re-processing the prompt from scratch.
     private async Task<(double score, double effectiveTgRate)> RunAgentLoopBenchmarksAsync(
-        OptimizationProfile profile, CancellationToken ct)
+        OptimizationProfile profile, CancellationToken ct, Action<string>? onPhase = null)
     {
         object? toolsPayload = profile.ToolDefinitions.Count > 0
             ? profile.ToolDefinitions.Select(t => new
@@ -277,10 +304,14 @@ public class BenchmarkService(
         long totalTokens = 0;
         double totalWallMs = 0;
         int ran = 0;
+        int caseTotal = profile.AgentLoopCases.Count;
+        int caseIdx = 0;
 
         foreach (var loopCase in profile.AgentLoopCases)
         {
             ct.ThrowIfCancellationRequested();
+            caseIdx++;
+            onPhase?.Invoke($"Running agent-loop scenario ({caseIdx}/{caseTotal})…");
             try
             {
                 var (caseScore, tokens, wallMs) = await RunAgentLoopCaseAsync(loopCase, toolsPayload, profile, ct);
@@ -384,12 +415,16 @@ public class BenchmarkService(
 
     // Runs the profile's accuracy probes and returns the fraction answered correctly.
     // Correct = the response contains any acceptable answer (case-insensitive).
-    private async Task<double> RunAccuracyPromptsAsync(OptimizationProfile profile, CancellationToken ct)
+    private async Task<double> RunAccuracyPromptsAsync(OptimizationProfile profile, CancellationToken ct, Action<string>? onPhase = null)
     {
         int correct = 0;
+        int total = profile.AccuracyPrompts.Count;
+        int idx = 0;
         foreach (var probe in profile.AccuracyPrompts)
         {
             ct.ThrowIfCancellationRequested();
+            idx++;
+            onPhase?.Invoke($"Checking accuracy ({idx}/{total})…");
             try
             {
                 var (response, _) = await server.CompleteAsync(new CompletionRequest

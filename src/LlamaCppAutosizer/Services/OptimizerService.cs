@@ -36,9 +36,11 @@ public class OptimizerService(
         OptimizationProfile profile,
         OptimizationSession session,
         OptimizationOptions? options = null,
+        Action<string>? onPhase = null,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         options ??= new OptimizationOptions();
+        onPhase?.Invoke("Detecting hardware…");
         var hw = await hardware.DetectAsync();
         session.Hardware = hw;
 
@@ -46,14 +48,16 @@ public class OptimizerService(
         {
             // ── Iteration 0: baseline ─────────────────────────────────────────
             logger.LogInformation("Starting baseline benchmark");
+            onPhase?.Invoke("Starting llama-server (baseline)…");
             await StartServerAsync(serverExecutable, modelPath, initialSettings, options.Port, ct);
             // Server may have auto-reverted an unsupported setting (e.g. mmap, quantized KV
             // cache) to get started — use what's actually running, not what was requested.
             var effectiveInitialSettings = server.LastEffectiveSettings ?? initialSettings;
             string? initialAdjustment = server.LastStartAdjustmentNote;
 
+            onPhase?.Invoke("Running baseline benchmark…");
             var baselineResult = await benchmarks.RunAsync(effectiveInitialSettings, modelPath, profile, ct,
-                options.IncludeRepetitionStressTest);
+                options.IncludeRepetitionStressTest, onPhase);
             baselineResult.CompositeScore = profile.ScoreResult(baselineResult);
             baselineResult.Notes = "Baseline";
 
@@ -91,6 +95,7 @@ public class OptimizerService(
                 // Refresh hardware readings while the previous iteration's server is still
                 // running — recommendations then see real remaining VRAM/RAM headroom with
                 // the model loaded, not the stale pre-load numbers from session start.
+                onPhase?.Invoke($"Iteration {iter}/{options.MaxIterations} — refreshing hardware info…");
                 hw = await hardware.DetectAsync();
 
                 // ── Pick the next change to try ───────────────────────────────
@@ -103,6 +108,7 @@ public class OptimizerService(
                     logger.LogInformation("{N} consecutive non-improvements — asking LLM for final push",
                         maxConsecutiveNonImprovements);
 
+                    onPhase?.Invoke($"Iteration {iter}/{options.MaxIterations} — asking LLM for a fresh angle…");
                     change = await recommender.GetFinalPushAsync(session, profile, hw, ct);
                     if (change is null)
                     {
@@ -112,11 +118,13 @@ public class OptimizerService(
                 }
                 else
                 {
+                    onPhase?.Invoke($"Iteration {iter}/{options.MaxIterations} — asking for next recommendation…");
                     change = await recommender.GetNextRecommendationAsync(session, profile, hw, ct);
                     if (change is null)
                     {
                         // Normal pool exhausted — try the final push before giving up
                         logger.LogInformation("Recommendation pool empty — trying final-push LLM prompt");
+                        onPhase?.Invoke($"Iteration {iter}/{options.MaxIterations} — asking LLM for a fresh angle…");
                         change = await recommender.GetFinalPushAsync(session, profile, hw, ct);
                         if (change is null)
                         {
@@ -134,12 +142,14 @@ public class OptimizerService(
                     iter, change.Describe(), change.Source);
 
                 // ── Start server with new settings ────────────────────────────
+                onPhase?.Invoke($"Iteration {iter}/{options.MaxIterations} — applying {change.Describe()}…");
                 await StopServerAsync();
                 string? startFailReason = null;
                 string? startAdjustment = null;
                 bool fatalStartFailure = false;
                 try
                 {
+                    onPhase?.Invoke($"Iteration {iter}/{options.MaxIterations} — starting llama-server…");
                     await StartServerAsync(serverExecutable, modelPath, nextSettings, options.Port, ct);
                     consecutiveStartFailures = 0;
                     // Server may have auto-reverted an unsupported setting (e.g. quantized KV
@@ -214,12 +224,13 @@ public class OptimizerService(
                 }
 
                 // ── Benchmark ─────────────────────────────────────────────────
+                onPhase?.Invoke($"Iteration {iter}/{options.MaxIterations} — running benchmark…");
                 BenchmarkResult? iterResult = null;
                 string? benchFailReason = null;
                 try
                 {
                     iterResult = await benchmarks.RunAsync(nextSettings, modelPath, profile, ct,
-                        options.IncludeRepetitionStressTest);
+                        options.IncludeRepetitionStressTest, onPhase);
                     iterResult.CompositeScore = profile.ScoreResult(iterResult);
                 }
                 catch (OperationCanceledException)
@@ -305,11 +316,13 @@ public class OptimizerService(
                 {
                     var verifySettings = champ.Settings.Clone();
                     verifySettings.Label = "verify";
+                    onPhase?.Invoke("Verifying best configuration — restarting llama-server…");
                     await StopServerAsync();
                     await StartServerAsync(serverExecutable, modelPath, verifySettings, options.Port, ct);
 
+                    onPhase?.Invoke("Verifying best configuration — re-running benchmark…");
                     var verifyResult = await benchmarks.RunAsync(verifySettings, modelPath, profile, ct,
-                        options.IncludeRepetitionStressTest);
+                        options.IncludeRepetitionStressTest, onPhase);
                     verifyResult.CompositeScore = profile.ScoreResult(verifyResult);
 
                     MergeVerification(champ, verifyResult, profile);
