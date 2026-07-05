@@ -24,6 +24,10 @@ public class MainMenu(
     private LlamaSettings _manualSettings = new();
     private HardwareInfo? _hardware;
 
+    // Gate for turbo4/turbo3/etc. KV cache types anywhere in the UI — only true once the
+    // TurboQuant menu has resolved and persisted a working TurboQuant-fork llama-server.
+    private bool TurboQuantAvailable => !string.IsNullOrWhiteSpace(appSettings.Current.TurboQuantServerExecutable);
+
     private const string ConfigFile = "autosizer-config.json";
     private static readonly string[] SpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -348,6 +352,13 @@ public class MainMenu(
         else
         {
             initialSettings = OptimizerService.BuildInitialSettings(_modelPath, _profile, _hardware);
+
+            // Hardware presets never set a KV cache type (they leave it at the f16 default).
+            // Carry forward whatever cache type was last chosen via "Edit llama.cpp Settings
+            // Manually" or the TurboQuant cache-type screen — otherwise those choices are
+            // silently discarded the moment you start a fresh (non-profile) optimization run.
+            if (_manualSettings.CacheTypeK is not null) initialSettings.CacheTypeK = _manualSettings.CacheTypeK;
+            if (_manualSettings.CacheTypeV is not null) initialSettings.CacheTypeV = _manualSettings.CacheTypeV;
         }
 
         // Show and allow override
@@ -356,7 +367,7 @@ public class MainMenu(
         AnsiConsole.WriteLine();
 
         if (AnsiConsole.Confirm("Override any settings before starting?", false))
-            initialSettings = SettingsEditor.Edit(initialSettings, "Starting Settings", _modelPath);
+            initialSettings = SettingsEditor.Edit(initialSettings, "Starting Settings", _modelPath, TurboQuantAvailable);
 
         AnsiConsole.WriteLine();
         AnsiConsole.Write(new Panel(
@@ -636,7 +647,7 @@ public class MainMenu(
 
     private void EditSettingsManually()
     {
-        _manualSettings = SettingsEditor.Edit(_manualSettings, "Manual Settings Editor", _modelPath);
+        _manualSettings = SettingsEditor.Edit(_manualSettings, "Manual Settings Editor", _modelPath, TurboQuantAvailable);
         AnsiConsole.MarkupLine("[green]Settings updated.[/]");
 
         if (string.IsNullOrEmpty(_modelPath) || !File.Exists(_modelPath))
@@ -722,6 +733,17 @@ public class MainMenu(
     {
         AnsiConsole.WriteLine();
         AnsiConsole.Write(new Rule("[bold magenta]TurboQuant KV Cache Types[/]").RuleStyle("magenta"));
+
+        if (!TurboQuantAvailable)
+        {
+            AnsiConsole.MarkupLine("[yellow]No TurboQuant llama-server is set up yet.[/]");
+            AnsiConsole.MarkupLine("[grey]Resolve a TurboQuant executable first (this menu will prompt for its path).[/]");
+            AnsiConsole.WriteLine();
+            AnsiConsole.WriteLine("Press any key...");
+            Console.ReadKey(intercept: true);
+            return;
+        }
+
         AnsiConsole.MarkupLine("[grey]These types are only supported by the TurboQuant fork of llama-server.[/]");
         AnsiConsole.MarkupLine("[grey]Typical recommendation: --cache-type-k turbo4 --cache-type-v turbo3[/]");
         AnsiConsole.WriteLine();
@@ -749,7 +771,8 @@ public class MainMenu(
 
         AnsiConsole.WriteLine();
         AnsiConsole.MarkupLine($"[green]Set:[/] --cache-type-k [cyan]{finalK}[/]  --cache-type-v [cyan]{finalV}[/]");
-        AnsiConsole.MarkupLine("[grey]These settings are now active in manual settings and will be used on next run.[/]");
+        AnsiConsole.MarkupLine("[grey]Will be used as the starting cache type on your next optimization run, unless you start from a saved profile.[/]");
+        AnsiConsole.MarkupLine("[grey]Requires --server-executable in Settings to point at the TurboQuant fork's llama-server build.[/]");
         AnsiConsole.WriteLine();
         AnsiConsole.WriteLine("Press any key...");
         Console.ReadKey(intercept: true);
@@ -762,7 +785,12 @@ public class MainMenu(
         AnsiConsole.MarkupLine("[grey]https://github.com/TheTom/llama-cpp-turboquant[/]");
         AnsiConsole.WriteLine();
 
-        bool available = turboQuant.IsAvailable();
+        // Reuse the persisted TurboQuant executable from a prior session before falling back
+        // to a bare PATH probe or re-prompting the user for its location every time.
+        string? savedExe = appSettings.Current.TurboQuantServerExecutable;
+        bool available = (!string.IsNullOrWhiteSpace(savedExe) && turboQuant.IsAvailable(savedExe))
+            || turboQuant.IsAvailable();
+
         if (!available)
         {
             AnsiConsole.MarkupLine("[yellow]turboquant not found in PATH.[/]");
@@ -792,6 +820,18 @@ public class MainMenu(
                 Console.ReadKey(intercept: true);
                 return;
             }
+
+            savedExe = resolved;
+        }
+
+        // Persist so the turbo cache-type options elsewhere in the UI (SettingsEditor,
+        // manual settings) know a TurboQuant-capable server is actually set up, and so this
+        // menu doesn't need to re-resolve the path every session.
+        if (!string.IsNullOrWhiteSpace(savedExe) &&
+            !string.Equals(appSettings.Current.TurboQuantServerExecutable, savedExe, StringComparison.OrdinalIgnoreCase))
+        {
+            appSettings.Current.TurboQuantServerExecutable = savedExe;
+            appSettings.Save();
         }
 
         string? choice = MenuHelper.Select(

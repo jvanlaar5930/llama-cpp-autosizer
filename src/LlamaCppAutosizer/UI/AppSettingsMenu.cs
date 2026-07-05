@@ -53,6 +53,9 @@ public class AppSettingsMenu(AppSettingsService appSettings)
         table.AddRow("[grey]llama-server path[/]", $"[cyan]{Markup.Escape(s.ServerExecutable)}[/]");
         table.AddRow("[grey]Profiles directory[/]", $"[cyan]{Markup.Escape(s.ProfilesDirectory)}[/]");
         table.AddRow("[grey]Sessions directory[/]", $"[cyan]{Markup.Escape(s.SessionsDirectory)}[/]");
+        table.AddRow("[grey]TurboQuant server[/]", string.IsNullOrWhiteSpace(s.TurboQuantServerExecutable)
+            ? "[yellow]not set up — turbo4/turbo3/etc. cache types hidden until configured (TurboQuant Options menu)[/]"
+            : $"[cyan]{Markup.Escape(s.TurboQuantServerExecutable)}[/]");
 
         AnsiConsole.Write(table);
     }

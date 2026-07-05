@@ -5,11 +5,21 @@ namespace LlamaCppAutosizer.UI;
 
 public static class SettingsEditor
 {
+    private static readonly string[] AllCacheTypes =
+        [.. LlamaSettings.ValidCacheTypes, .. LlamaSettings.TurboQuantCacheTypes];
+
     /// <summary>
     /// Interactively lets the user review and override any LlamaSettings field.
     /// Returns the (possibly modified) settings.
     /// </summary>
-    public static LlamaSettings Edit(LlamaSettings settings, string title = "Edit Settings", string? modelPath = null)
+    /// <param name="turboQuantAvailable">
+    /// Only offer turbo4/turbo3/etc. KV cache types when a TurboQuant-fork llama-server has
+    /// actually been configured (see AppSettings.TurboQuantServerExecutable) — otherwise
+    /// selecting one would silently do nothing against a stock llama-server.
+    /// </param>
+    public static LlamaSettings Edit(
+        LlamaSettings settings, string title = "Edit Settings", string? modelPath = null,
+        bool turboQuantAvailable = false)
     {
         var s = settings.Clone();
         bool isMoe = LlamaSettings.IsMoeModel(modelPath);
@@ -91,13 +101,16 @@ public static class SettingsEditor
                     s.Mlock = AnsiConsole.Confirm("Lock model in RAM (mlock)?", s.Mlock);
                     break;
                 case "KV Cache Type K":
+                    // Turbo types (turbo4/turbo3/...) only offered once TurboQuant is set up
+                    // (see turboQuantAvailable) — otherwise picking one would silently do
+                    // nothing against a stock llama-server.
                     s.CacheTypeK = PromptEnum("KV Cache type K",
-                        s.CacheTypeK ?? "f16", LlamaSettings.ValidCacheTypes);
+                        s.CacheTypeK ?? "f16", turboQuantAvailable ? AllCacheTypes : LlamaSettings.ValidCacheTypes);
                     if (s.CacheTypeK == "f16") s.CacheTypeK = null;
                     break;
                 case "KV Cache Type V":
                     s.CacheTypeV = PromptEnum("KV Cache type V",
-                        s.CacheTypeV ?? "f16", LlamaSettings.ValidCacheTypes);
+                        s.CacheTypeV ?? "f16", turboQuantAvailable ? AllCacheTypes : LlamaSettings.ValidCacheTypes);
                     if (s.CacheTypeV == "f16") s.CacheTypeV = null;
                     break;
                 case "Parallel Slots":

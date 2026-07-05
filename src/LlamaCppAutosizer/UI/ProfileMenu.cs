@@ -8,7 +8,8 @@ namespace LlamaCppAutosizer.UI;
 
 public class ProfileMenu(
     ProfileLibraryService library,
-    LlamaServerService server)
+    LlamaServerService server,
+    AppSettingsService appSettings)
 {
     // -------------------------------------------------------------------------
     // Entry point — called from MainMenu
@@ -476,7 +477,8 @@ public class ProfileMenu(
         AnsiConsole.WriteLine();
         AnsiConsole.MarkupLine($"Editing settings for [cyan]{Markup.Escape(profile.Name)}[/]:");
 
-        var updated = SettingsEditor.Edit(profile.Settings, $"Edit — {profile.Name}");
+        var updated = SettingsEditor.Edit(profile.Settings, $"Edit — {profile.Name}",
+            turboQuantAvailable: !string.IsNullOrWhiteSpace(appSettings.Current.TurboQuantServerExecutable));
 
         // Copy changed values back (Settings is init-only, so replace inline)
         var fresh = new SavedProfile

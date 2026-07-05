@@ -11,6 +11,12 @@ public class AppSettings
     public string ServerExecutable { get; set; } = "llama-server";
     public string ProfilesDirectory { get; set; } = "";
     public string SessionsDirectory { get; set; } = "";
+
+    // Set once the TurboQuant menu has resolved a working TurboQuant-fork llama-server
+    // executable. Its presence is the gate for exposing turbo4/turbo3/etc. KV cache types
+    // anywhere else in the UI — without it, picking those types would silently do nothing
+    // (or fail to start) since stock llama-server doesn't recognize them.
+    public string? TurboQuantServerExecutable { get; set; }
 }
 
 public class AppSettingsService
