@@ -205,6 +205,23 @@ public class RecommendationService(
             ? $"\n- MoeExpertUsed: integer, e.g. 4, 6, 8, 12 (fewer experts = less VRAM + faster; current={bestSettings.MoeExpertUsed?.ToString() ?? "model default"})"
             : "";
 
+        // Thinking-capable models (Qwen3/QwQ/DeepSeek-R1) start every run with reasoning
+        // forced off for benchmark speed/consistency — CoT tokens would otherwise dominate
+        // every timing. Surface it as an explorable parameter so the LLM can trade some of
+        // that speed back for reasoning quality when the profile/target calls for it
+        // (e.g. Agentic tool-call accuracy), rather than it being permanently locked off.
+        bool isThinking = LlamaSettings.IsThinkingModel(session.ModelPath);
+        string thinkingContext = isThinking
+            ? $"\nMODEL TYPE: Thinking/reasoning model (chain-of-thought). Currently thinking=" +
+              $"{(bestSettings.ThinkingEnabled ?? false)}. Disabled by default at baseline for benchmark " +
+              $"speed — enabling it adds reasoning tokens before the answer, which costs speed but can " +
+              $"improve answer/tool-call correctness."
+            : "";
+
+        string thinkingParam = isThinking
+            ? "\n- ThinkingEnabled: true or false (enabling costs TG speed and TTFT but can improve reasoning/tool-call correctness)"
+            : "";
+
         string guidance = string.IsNullOrWhiteSpace(session.UserGuidance)
             ? ""
             : $"\nUSER GUIDANCE (follow this even if it means a different tradeoff than the profile default): {session.UserGuidance}\n";
@@ -219,7 +236,7 @@ HARDWARE:
 - RAM: {{hardware.RamTotalMb}} MB total, {{hardware.RamFreeMb}} MB free
 - CPU: {{hardware.CpuName}} — {{hardware.CpuCores}} cores / {{hardware.CpuThreads}} threads
 
-PROFILE: {{profile.Name}} — {{profile.Description}}{{moeContext}}
+PROFILE: {{profile.Name}} — {{profile.Description}}{{moeContext}}{{thinkingContext}}
 {{guidance}}
 
 BEST SETTINGS SO FAR (score={{best.CompositeScore:F3}} | TG={{best.GenerationRate:F0}}t/s PP={{best.PromptProcessingRate:F0}}t/s TTFT={{best.TimeToFirstTokenMs:F0}}ms):
@@ -230,7 +247,7 @@ BEST SETTINGS SO FAR (score={{best.CompositeScore:F3}} | TG={{best.GenerationRat
 - cache-type-k: {{bestSettings.CacheTypeK ?? "f16"}} / cache-type-v: {{bestSettings.CacheTypeV ?? "f16"}}
 - threads: {{bestSettings.Threads}} (-1 = auto)
 - mmap: {{bestSettings.Mmap}} / mlock: {{bestSettings.Mlock}}
-- repeat-penalty: {{bestSettings.RepeatPenalty?.ToString() ?? "server default"}} / repeat-last-n: {{bestSettings.RepeatLastN?.ToString() ?? "server default"}} / dry-multiplier: {{bestSettings.DryMultiplier?.ToString() ?? "server default"}}
+- repeat-penalty: {{bestSettings.RepeatPenalty?.ToString() ?? "server default"}} / repeat-last-n: {{bestSettings.RepeatLastN?.ToString() ?? "server default"}} / dry-multiplier: {{bestSettings.DryMultiplier?.ToString() ?? "server default"}}{{(isThinking ? $"\n- thinking: {bestSettings.ThinkingEnabled ?? false}" : "")}}
 
 FULL OPTIMIZATION HISTORY:
 {{string.Join("\n", historyLines)}}
@@ -256,7 +273,7 @@ Valid parameters and example values:
 - Mlock: true or false
 - RepeatPenalty: 1.0 (off) to 1.5, e.g. 1.1
 - RepeatLastN: -1 (whole context), 0 (off), or a positive window size, e.g. 256
-- DryMultiplier: 0 (off) to 2.0, e.g. 0.8{{moeParam}}
+- DryMultiplier: 0 (off) to 2.0, e.g. 0.8{{moeParam}}{{thinkingParam}}
 
 Respond with ONLY this JSON (no markdown, no extra text before or after):
 {"parameter":"<name>","value":<value>,"reasoning":"<one hypothesis sentence: what you expect to happen and why — do not restate numbers from the history above>"}
@@ -270,6 +287,7 @@ Respond with ONLY this JSON (no markdown, no extra text before or after):
         var bestSettings = session.Best!.Settings;
         double baselineScore = session.Iterations[0].Result.CompositeScore;
         bool isMoe = LlamaSettings.IsMoeModel(session.ModelPath);
+        bool isThinking = LlamaSettings.IsThinkingModel(session.ModelPath);
 
         var triedSummary = session.Iterations
             .Where(i => i.AppliedChange is not null)
@@ -280,6 +298,11 @@ Respond with ONLY this JSON (no markdown, no extra text before or after):
 
         string moeParam = isMoe
             ? $"\n- MoeExpertUsed: integer (e.g. 4, 6, 8, 12) — fewer experts saves VRAM and increases speed"
+            : "";
+
+        string thinkingParam = isThinking
+            ? "\n- ThinkingEnabled: true or false (currently " + (bestSettings.ThinkingEnabled ?? false) +
+              " — enabling reasoning costs speed but can improve answer/tool-call correctness; hasn't necessarily been tried yet)"
             : "";
 
         string guidance = string.IsNullOrWhiteSpace(session.UserGuidance)
@@ -303,7 +326,7 @@ BEST SETTINGS (score={{best.CompositeScore:F3}} vs baseline={{baselineScore:F3}}
 - flash-attn: {{bestSettings.FlashAttention}}
 - cache-type-k: {{bestSettings.CacheTypeK ?? "f16"}} / cache-type-v: {{bestSettings.CacheTypeV ?? "f16"}}
 - threads: {{bestSettings.Threads}} / mmap: {{bestSettings.Mmap}} / mlock: {{bestSettings.Mlock}}
-- repeat-penalty: {{bestSettings.RepeatPenalty?.ToString() ?? "server default"}} / repeat-last-n: {{bestSettings.RepeatLastN?.ToString() ?? "server default"}} / dry-multiplier: {{bestSettings.DryMultiplier?.ToString() ?? "server default"}}
+- repeat-penalty: {{bestSettings.RepeatPenalty?.ToString() ?? "server default"}} / repeat-last-n: {{bestSettings.RepeatLastN?.ToString() ?? "server default"}} / dry-multiplier: {{bestSettings.DryMultiplier?.ToString() ?? "server default"}}{{(isThinking ? $"\n- thinking: {bestSettings.ThinkingEnabled ?? false}" : "")}}
 
 ALREADY TRIED (do NOT repeat any of these parameter=value pairs — recreating an already-benchmarked configuration will be rejected):
 {{string.Join("\n", triedSummary)}}
@@ -324,7 +347,7 @@ We need a fresh approach. Think carefully about:
 - Thread count tuning for CPU-bound operations
 - Mlock if the model fits in RAM
 - Ubatch vs batch ratios
-- If quality has cratered (likely a repetition loop): RepeatPenalty, RepeatLastN, or DryMultiplier haven't necessarily been tried yet{{moeParam}}
+- If quality has cratered (likely a repetition loop): RepeatPenalty, RepeatLastN, or DryMultiplier haven't necessarily been tried yet{{moeParam}}{{thinkingParam}}
 
 If you genuinely believe no further optimization is possible given what has been tried and the hardware constraints, respond with exactly:
 DONE

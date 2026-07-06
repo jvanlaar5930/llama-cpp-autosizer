@@ -33,6 +33,16 @@ public class AppSettingsService
 
     public AppSettings Current { get; private set; } = new();
 
+    // The executable actually used to launch llama-server for real runs. When a TurboQuant
+    // server has been configured, it overrides the main server path everywhere (optimization
+    // runs, profile testing, exported commands) — that's the whole point of setting it.
+    public string EffectiveServerExecutable => string.IsNullOrWhiteSpace(Current.TurboQuantServerExecutable)
+        ? Current.ServerExecutable
+        : Current.TurboQuantServerExecutable;
+
+    // Gate for turbo4/turbo3/etc. KV cache types anywhere in the UI.
+    public bool TurboQuantAvailable => !string.IsNullOrWhiteSpace(Current.TurboQuantServerExecutable);
+
     public AppSettingsService()
     {
         Load();

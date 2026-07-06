@@ -477,8 +477,8 @@ public class ProfileMenu(
         AnsiConsole.WriteLine();
         AnsiConsole.MarkupLine($"Editing settings for [cyan]{Markup.Escape(profile.Name)}[/]:");
 
-        var updated = SettingsEditor.Edit(profile.Settings, $"Edit — {profile.Name}",
-            turboQuantAvailable: !string.IsNullOrWhiteSpace(appSettings.Current.TurboQuantServerExecutable));
+        var updated = SettingsEditor.Edit(profile.Settings, $"Edit — {profile.Name}", profile.ModelPath,
+            appSettings.TurboQuantAvailable);
 
         // Copy changed values back (Settings is init-only, so replace inline)
         var fresh = new SavedProfile
@@ -580,7 +580,7 @@ public class ProfileMenu(
         var labels = profiles
             .Select(p =>
             {
-                string avail = ProfileLibraryService.IsModelAvailable(p) ? "" : " [red][missing][/]";
+                string avail = ProfileLibraryService.IsModelAvailable(p) ? "" : " [red][[missing]][/]";
                 string meta = p.BenchmarkTgRate.HasValue
                     ? $"[grey]  TG={p.BenchmarkTgRate:F0}t/s[/]"
                     : "";
@@ -622,7 +622,7 @@ public class ProfileMenu(
             bool avail = ProfileLibraryService.IsModelAvailable(p);
             string nameCell = avail
                 ? $"[bold]{Markup.Escape(p.Name)}[/]"
-                : $"[grey]{Markup.Escape(p.Name)}[/] [red][missing][/]";
+                : $"[grey]{Markup.Escape(p.Name)}[/] [red][[missing]][/]";
 
             table.AddRow(
                 nameCell,

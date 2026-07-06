@@ -8,7 +8,6 @@ public class MainMenu(
     HardwareDetectionService hwService,
     OptimizerService optimizer,
     LlamaServerService llamaServer,
-    TurboQuantService turboQuant,
     SessionPersistenceService persistence,
     ProfileLibraryService profileLibrary,
     ProfileMenu profileMenu,
@@ -23,10 +22,6 @@ public class MainMenu(
     private OptimizationProfile _profile = OptimizationProfile.Chat();
     private LlamaSettings _manualSettings = new();
     private HardwareInfo? _hardware;
-
-    // Gate for turbo4/turbo3/etc. KV cache types anywhere in the UI — only true once the
-    // TurboQuant menu has resolved and persisted a working TurboQuant-fork llama-server.
-    private bool TurboQuantAvailable => !string.IsNullOrWhiteSpace(appSettings.Current.TurboQuantServerExecutable);
 
     private const string ConfigFile = "autosizer-config.json";
     private static readonly string[] SpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -52,9 +47,8 @@ public class MainMenu(
                     "3. Run Auto-Optimization",
                     "4. Edit llama.cpp Settings Manually",
                     "5. Named Profiles  (run / manage)",
-                    "6. TurboQuant Options",
-                    "7. View / Load Sessions",
-                    "8. Settings  (model folder, server path, storage)",
+                    "6. View / Load Sessions",
+                    "7. Settings  (model folder, server path, storage, TurboQuant)",
                     "H. Historical Benchmark Comparison",
                     "0. Exit",
                 ],
@@ -71,10 +65,12 @@ public class MainMenu(
                     case '2': await DetectHardwareAsync(ct); break;
                     case '3': await RunOptimizationAsync(ct); break;
                     case '4': EditSettingsManually(); break;
-                    case '5': await profileMenu.RunAsync(appSettings.Current.ServerExecutable, ct); break;
-                    case '6': await TurboQuantMenuAsync(ct); break;
-                    case '7': await ViewSessionsAsync(ct); break;
-                    case '8': settingsMenu.Run(); break;
+                    case '5': await profileMenu.RunAsync(appSettings.EffectiveServerExecutable, ct); break;
+                    case '6': await ViewSessionsAsync(ct); break;
+                    case '7':
+                        string? newModelPath = await settingsMenu.RunAsync(_manualSettings, _modelPath, ct);
+                        if (newModelPath is not null) _modelPath = newModelPath;
+                        break;
                     case 'H': case 'h': await HistoricalComparisonAsync(ct); break;
                 }
                 SaveConfig();
@@ -109,7 +105,7 @@ public class MainMenu(
         if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
         {
             AnsiConsole.MarkupLine(
-                "[yellow]No valid model folder configured.[/] Set one in [cyan]Settings[/] (menu option 8), " +
+                "[yellow]No valid model folder configured.[/] Set one in [cyan]Settings[/] (menu option 7), " +
                 "or enter a folder now.");
             string manualFolder = AnsiConsole.Prompt(
                 new TextPrompt<string>(
@@ -367,7 +363,7 @@ public class MainMenu(
         AnsiConsole.WriteLine();
 
         if (AnsiConsole.Confirm("Override any settings before starting?", false))
-            initialSettings = SettingsEditor.Edit(initialSettings, "Starting Settings", _modelPath, TurboQuantAvailable);
+            initialSettings = SettingsEditor.Edit(initialSettings, "Starting Settings", _modelPath, appSettings.TurboQuantAvailable);
 
         AnsiConsole.WriteLine();
         AnsiConsole.Write(new Panel(
@@ -452,7 +448,7 @@ public class MainMenu(
 
         // Optimizer writes iterations into session directly; we only read them here for the UI.
         var iterations = optimizer.OptimizeAsync(
-            appSettings.Current.ServerExecutable, _modelPath, initialSettings, _profile, session, opts,
+            appSettings.EffectiveServerExecutable, _modelPath, initialSettings, _profile, session, opts,
             onPhase: p => currentPhase = p, cts.Token);
 
         AnsiConsole.Write(new Rule("[grey dim]llama-server log (scroll up for history) — L: toggle full/truncated[/]").RuleStyle("grey dim"));
@@ -623,7 +619,7 @@ public class MainMenu(
         llamaServer.SetLogHandler(null);
 
         AnsiConsole.WriteLine();
-        BenchmarkDisplay.RenderFinalResults(session, appSettings.Current.ServerExecutable);
+        BenchmarkDisplay.RenderFinalResults(session, appSettings.EffectiveServerExecutable);
 
         if (AnsiConsole.Confirm("\nExport results to file?", true))
         {
@@ -647,7 +643,7 @@ public class MainMenu(
 
     private void EditSettingsManually()
     {
-        _manualSettings = SettingsEditor.Edit(_manualSettings, "Manual Settings Editor", _modelPath, TurboQuantAvailable);
+        _manualSettings = SettingsEditor.Edit(_manualSettings, "Manual Settings Editor", _modelPath, appSettings.TurboQuantAvailable);
         AnsiConsole.MarkupLine("[green]Settings updated.[/]");
 
         if (string.IsNullOrEmpty(_modelPath) || !File.Exists(_modelPath))
@@ -729,189 +725,8 @@ public class MainMenu(
         AnsiConsole.MarkupLine("[grey]Access it any time from menu option 5.[/]");
     }
 
-    private void ConfigureTurboQuantCacheTypes()
-    {
-        AnsiConsole.WriteLine();
-        AnsiConsole.Write(new Rule("[bold magenta]TurboQuant KV Cache Types[/]").RuleStyle("magenta"));
-
-        if (!TurboQuantAvailable)
-        {
-            AnsiConsole.MarkupLine("[yellow]No TurboQuant llama-server is set up yet.[/]");
-            AnsiConsole.MarkupLine("[grey]Resolve a TurboQuant executable first (this menu will prompt for its path).[/]");
-            AnsiConsole.WriteLine();
-            AnsiConsole.WriteLine("Press any key...");
-            Console.ReadKey(intercept: true);
-            return;
-        }
-
-        AnsiConsole.MarkupLine("[grey]These types are only supported by the TurboQuant fork of llama-server.[/]");
-        AnsiConsole.MarkupLine("[grey]Typical recommendation: --cache-type-k turbo4 --cache-type-v turbo3[/]");
-        AnsiConsole.WriteLine();
-
-        var allK = LlamaSettings.ValidCacheTypes.Concat(LlamaSettings.TurboQuantCacheTypes).ToArray();
-        var allV = allK;
-
-        string currentK = _manualSettings.CacheTypeK ?? "f16";
-        string currentV = _manualSettings.CacheTypeV ?? "f16";
-
-        AnsiConsole.MarkupLine($"[grey]Current cache-type-k:[/] [cyan]{currentK}[/]");
-        string? newK = MenuHelper.Select(
-            "Select [bold]cache-type-k[/]  [dim](Esc = keep current)[/]",
-            allK);
-        if (newK is not null) _manualSettings.CacheTypeK = newK == "f16" ? null : newK;
-
-        AnsiConsole.MarkupLine($"[grey]Current cache-type-v:[/] [cyan]{currentV}[/]");
-        string? newV = MenuHelper.Select(
-            "Select [bold]cache-type-v[/]  [dim](Esc = keep current)[/]",
-            allV);
-        if (newV is not null) _manualSettings.CacheTypeV = newV == "f16" ? null : newV;
-
-        string finalK = _manualSettings.CacheTypeK ?? "f16";
-        string finalV = _manualSettings.CacheTypeV ?? "f16";
-
-        AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine($"[green]Set:[/] --cache-type-k [cyan]{finalK}[/]  --cache-type-v [cyan]{finalV}[/]");
-        AnsiConsole.MarkupLine("[grey]Will be used as the starting cache type on your next optimization run, unless you start from a saved profile.[/]");
-        AnsiConsole.MarkupLine("[grey]Requires --server-executable in Settings to point at the TurboQuant fork's llama-server build.[/]");
-        AnsiConsole.WriteLine();
-        AnsiConsole.WriteLine("Press any key...");
-        Console.ReadKey(intercept: true);
-    }
-
-    private async Task TurboQuantMenuAsync(CancellationToken ct)
-    {
-        AnsiConsole.WriteLine();
-        AnsiConsole.Write(new Rule("[bold magenta]TurboQuant[/]").RuleStyle("magenta"));
-        AnsiConsole.MarkupLine("[grey]https://github.com/TheTom/llama-cpp-turboquant[/]");
-        AnsiConsole.WriteLine();
-
-        // Reuse the persisted TurboQuant executable from a prior session before falling back
-        // to a bare PATH probe or re-prompting the user for its location every time.
-        string? savedExe = appSettings.Current.TurboQuantServerExecutable;
-        bool available = (!string.IsNullOrWhiteSpace(savedExe) && turboQuant.IsAvailable(savedExe))
-            || turboQuant.IsAvailable();
-
-        if (!available)
-        {
-            AnsiConsole.MarkupLine("[yellow]turboquant not found in PATH.[/]");
-            AnsiConsole.MarkupLine("[grey]You can provide a folder (will scan for the executable) or a direct path to the .exe.[/]");
-            AnsiConsole.WriteLine();
-
-            string? userInput = AnsiConsole.Prompt(
-                new TextPrompt<string>("Folder or path to turboquant (empty to skip):")
-                    .AllowEmpty());
-
-            if (string.IsNullOrWhiteSpace(userInput))
-            {
-                AnsiConsole.MarkupLine("[grey]Skipped.[/]");
-                AnsiConsole.WriteLine("Press any key...");
-                Console.ReadKey(intercept: true);
-                return;
-            }
-
-            // Resolve folder → executable
-            string? resolved = turboQuant.ResolveFromUserInput(userInput);
-            if (resolved is null || !turboQuant.IsAvailable(resolved))
-            {
-                AnsiConsole.MarkupLine($"[red]llama-server not found in:[/] {Markup.Escape(userInput)}");
-                AnsiConsole.MarkupLine("[grey]TurboQuant ships its own llama-server.exe. Point to the folder that contains it.[/]");
-                AnsiConsole.MarkupLine("[grey]Repo: https://github.com/TheTom/llama-cpp-turboquant[/]");
-                AnsiConsole.WriteLine("Press any key...");
-                Console.ReadKey(intercept: true);
-                return;
-            }
-
-            savedExe = resolved;
-        }
-
-        // Persist so the turbo cache-type options elsewhere in the UI (SettingsEditor,
-        // manual settings) know a TurboQuant-capable server is actually set up, and so this
-        // menu doesn't need to re-resolve the path every session.
-        if (!string.IsNullOrWhiteSpace(savedExe) &&
-            !string.Equals(appSettings.Current.TurboQuantServerExecutable, savedExe, StringComparison.OrdinalIgnoreCase))
-        {
-            appSettings.Current.TurboQuantServerExecutable = savedExe;
-            appSettings.Save();
-        }
-
-        string? choice = MenuHelper.Select(
-            "[bold magenta]TurboQuant Options[/]  [dim](Esc = back)[/]",
-            [
-                "Configure TurboQuant cache types  (turbo4 / turbo3 / …)",
-                "Quantize a model",
-                "Quantize current model and compare",
-            ]);
-
-        if (choice is null) return; // Escape
-
-        if (choice.StartsWith("Configure"))
-        {
-            ConfigureTurboQuantCacheTypes();
-            return;
-        }
-
-        string inputModel = choice.Contains("current") && !string.IsNullOrEmpty(_modelPath)
-            ? _modelPath
-            : AnsiConsole.Ask<string>("Path to model to quantize:", _modelPath);
-
-        if (!File.Exists(inputModel))
-        {
-            AnsiConsole.MarkupLine("[red]File not found.[/]");
-            return;
-        }
-
-        var quantType = AnsiConsole.Prompt(
-            new SelectionPrompt<QuantizationType>()
-                .Title("Select quantization type:")
-                .AddChoices(Enum.GetValues<QuantizationType>()));
-
-        string outputDir = AnsiConsole.Ask<string>(
-            "Output directory:",
-            Path.GetDirectoryName(inputModel) ?? ".");
-
-        var opts = new TurboQuantOptions
-        {
-            InputModelPath = inputModel,
-            OutputDirectory = outputDir,
-            QuantType = quantType,
-            UseImportance = AnsiConsole.Confirm("Use importance-matrix calibration?", true),
-            CalibrationSamples = AnsiConsole.Ask<int>("Calibration samples:", 512),
-        };
-
-        AnsiConsole.WriteLine();
-        var result = await AnsiConsole.Progress()
-            .Columns(new ProgressColumn[] { new TaskDescriptionColumn(), new SpinnerColumn() })
-            .StartAsync(async ctx =>
-            {
-                var task = ctx.AddTask("[magenta]Quantizing...[/]");
-                return await turboQuant.QuantizeAsync(opts,
-                    new Progress<string>(msg => task.Description = $"[magenta]{msg.Truncate(60)}[/]"),
-                    ct);
-            });
-
-        AnsiConsole.WriteLine();
-        if (result.Success)
-        {
-            AnsiConsole.MarkupLine($"[green]Quantization complete![/]");
-            AnsiConsole.MarkupLine($"Output: [cyan]{Markup.Escape(result.OutputPath)}[/]");
-            AnsiConsole.MarkupLine($"Size: [cyan]{result.OriginalSizeMb:N0} MB → {result.QuantizedSizeMb:N0} MB[/] " +
-                $"([green]{(1 - result.CompressionRatio) * 100:F1}% smaller[/])");
-            AnsiConsole.MarkupLine($"Duration: [grey]{result.Duration:mm\\:ss}[/]");
-
-            if (choice.Contains("compare") && AnsiConsole.Confirm("Benchmark quantized model now?", true))
-            {
-                _modelPath = result.OutputPath;
-                AnsiConsole.MarkupLine($"[green]Model path updated to quantized model.[/]");
-            }
-        }
-        else
-        {
-            AnsiConsole.MarkupLine($"[red]Quantization failed:[/] {Markup.Escape(result.ErrorMessage ?? "unknown error")}");
-        }
-
-        AnsiConsole.WriteLine("Press any key...");
-        Console.ReadKey(intercept: true);
-    }
+    // TurboQuant configuration (cache types, server executable, quantization) now lives in
+    // Settings — see AppSettingsMenu.RunAsync / TurboQuantSubmenuAsync.
 
     private async Task ViewSessionsAsync(CancellationToken ct)
     {
@@ -943,7 +758,7 @@ public class MainMenu(
         }
 
         AnsiConsole.WriteLine();
-        BenchmarkDisplay.RenderFinalResults(session, appSettings.Current.ServerExecutable);
+        BenchmarkDisplay.RenderFinalResults(session, appSettings.EffectiveServerExecutable);
 
         if (session.BestSettings is not null &&
             AnsiConsole.Confirm("Apply best settings from this session?", true))
@@ -1034,10 +849,10 @@ public class MainMenu(
 
     private bool ValidateReadyToRun()
     {
-        if (!string.IsNullOrEmpty(appSettings.Current.ServerExecutable)) return true;
+        if (!string.IsNullOrEmpty(appSettings.EffectiveServerExecutable)) return true;
 
         AnsiConsole.MarkupLine("[red]Cannot start — please fix:[/]");
-        AnsiConsole.MarkupLine("  [yellow]• llama-server path not set (Settings menu, option 8)[/]");
+        AnsiConsole.MarkupLine("  [yellow]• llama-server path not set (Settings menu, option 7)[/]");
         AnsiConsole.WriteLine("Press any key...");
         Console.ReadKey(intercept: true);
         return false;
@@ -1055,7 +870,7 @@ public class MainMenu(
 
         // Show current session state if anything is configured
         bool hasModel = !string.IsNullOrEmpty(_modelPath) && File.Exists(_modelPath);
-        bool hasServer = !string.IsNullOrEmpty(appSettings.Current.ServerExecutable);
+        bool hasServer = !string.IsNullOrEmpty(appSettings.EffectiveServerExecutable);
 
         if (hasModel || hasServer || _manualSettings.GpuLayers != new LlamaSettings().GpuLayers)
         {
@@ -1076,7 +891,7 @@ public class MainMenu(
             : "[grey]no model selected[/]";
 
         string serverCell = hasServer
-            ? $"[deepskyblue1]{Markup.Escape(Path.GetFileName(appSettings.Current.ServerExecutable))}[/]"
+            ? $"[deepskyblue1]{Markup.Escape(Path.GetFileName(appSettings.EffectiveServerExecutable))}[/]"
             : "[grey]not set[/]";
 
         // ── Settings summary row ──────────────────────────────────────────────
