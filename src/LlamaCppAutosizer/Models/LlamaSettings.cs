@@ -50,6 +50,9 @@ public class LlamaSettings
     // 0 disables it; null leaves the server default (usually already enabled).
     public float? DryMultiplier { get; set; }
 
+    // Path to a custom jinja chat template file (null = use the model's built-in template)
+    public string? ChatTemplateFile { get; set; }
+
     // Extra raw CLI args the user wants to inject
     public string? ExtraArgs { get; set; }
 
@@ -88,6 +91,7 @@ public class LlamaSettings
         if (RepeatPenalty.HasValue) { args.Add("--repeat-penalty"); args.Add(RepeatPenalty.Value.ToString()); }
         if (RepeatLastN.HasValue) { args.Add("--repeat-last-n"); args.Add(RepeatLastN.Value.ToString()); }
         if (DryMultiplier.HasValue) { args.Add("--dry-multiplier"); args.Add(DryMultiplier.Value.ToString()); }
+        if (!string.IsNullOrWhiteSpace(ChatTemplateFile)) { args.Add("--chat-template-file"); args.Add(ChatTemplateFile); }
 
         if (!string.IsNullOrWhiteSpace(ExtraArgs))
         {
@@ -118,7 +122,7 @@ public class LlamaSettings
         ParallelSlots, DefragThreshold,
         RopeScaling ?? "", RopeFreqBase?.ToString() ?? "", RopeFreqScale?.ToString() ?? "",
         RepeatPenalty?.ToString() ?? "", RepeatLastN?.ToString() ?? "", DryMultiplier?.ToString() ?? "",
-        ExtraArgs ?? "");
+        ChatTemplateFile ?? "", ExtraArgs ?? "");
 
     /// <summary>Human-readable summary of key parameters.</summary>
     public string Summary()

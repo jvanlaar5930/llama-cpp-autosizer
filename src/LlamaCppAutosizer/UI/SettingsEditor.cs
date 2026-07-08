@@ -50,6 +50,7 @@ public static class SettingsEditor
                 "KV Cache Type V",
                 "Parallel Slots",
                 "Rope Scaling",
+                "Chat Template (jinja file)",
                 "Extra CLI Args (raw)",
             };
             if (isMoe)
@@ -139,6 +140,13 @@ public static class SettingsEditor
                     s.RopeScaling = PromptOptionalString("RoPE scaling type (none/linear/yarn, empty to clear)",
                         s.RopeScaling);
                     break;
+                case "Chat Template (jinja file)":
+                    s.ChatTemplateFile = PromptOptionalString(
+                        "Path to a custom jinja chat template file (empty = use model's built-in template)",
+                        s.ChatTemplateFile);
+                    if (s.ChatTemplateFile is not null && !File.Exists(s.ChatTemplateFile))
+                        AnsiConsole.MarkupLine($"[yellow]Warning:[/] file not found at [grey]{Markup.Escape(s.ChatTemplateFile)}[/] (will still be passed to llama-server)");
+                    break;
                 case "Extra CLI Args (raw)":
                     s.ExtraArgs = PromptOptionalString(
                         "Extra raw CLI args to pass to llama-server (space-separated, empty to clear)",
@@ -180,6 +188,8 @@ public static class SettingsEditor
         }
         if (s.RopeScaling is not null)
             table.AddRow("rope-scaling", $"[cyan]{s.RopeScaling}[/]", "");
+        if (!string.IsNullOrWhiteSpace(s.ChatTemplateFile))
+            table.AddRow("chat-template-file", $"[cyan]{Markup.Escape(s.ChatTemplateFile)}[/]", "jinja template");
         if (!string.IsNullOrWhiteSpace(s.ExtraArgs))
             table.AddRow("extra-args", $"[yellow]{Markup.Escape(s.ExtraArgs)}[/]", "user-provided");
 
