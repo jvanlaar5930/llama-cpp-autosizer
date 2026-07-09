@@ -25,15 +25,17 @@ It spawns `llama-server`, runs a battery of timed prompts, collects real metrics
 
 - **Auto-discovery** — point to a folder and the tool scans for all `.gguf` files, showing name and size before you pick
 - **Two optimization profiles** — Chat (minimize latency, fast token generation) and Agentic (maximize throughput and tool-call reliability for agent loops)
-- **LLM-guided recommendations** — uses the running model to suggest the next parameter to test, with a heuristic fallback when the model can't respond
+- **LLM-guided recommendations** — uses the running model to suggest the next parameter to test, with a heuristic fallback when the model can't respond; for thinking-capable models it can also try re-enabling Thinking mode mid-run instead of leaving it permanently off after baseline
 - **Named profiles** — save optimized settings under a name, launch `llama-server` with one keypress, and reuse across sessions
-- **Manual overrides** — full interactive settings editor lets you pin any value or inject raw CLI args as hints before or during optimization
-- **TurboQuant integration** — set `turbo4`/`turbo3` KV cache types and quantize models via [llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant)
+- **Manual overrides** — full interactive settings editor lets you pin any value (including Thinking mode, MoE active-expert count, or a custom jinja chat template file) or inject raw CLI args as hints before or during optimization
+- **TurboQuant integration** — set `turbo4`/`turbo3` KV cache types and quantize models via [llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant); the turbo cache types stay hidden everywhere in the UI until a working TurboQuant `llama-server` is actually configured, so they can't silently no-op against a stock server
+- **Live phase progress** — during optimization the status line names the actual step underway (hardware detection, server start, which benchmark/tool/agent-loop case is running, LLM recommendation call, verification) instead of a bare spinner
+- **Per-category throughput (Agentic)** — breaks out token-generation speed by Chat TG, Tool-call TG, and Agent-loop TG instead of one aggregate number, since tool-call and agent-loop requests have a different throughput profile than plain chat; shown in the live footer, Results Summary, Iteration History, and Historical Comparison
 - **Live progress display** — status line and progress bar update in real time during optimization, showing PP speed, TG speed, TTFT, score, and whether a recommendation came from the model or heuristics; `llama-server`'s own log streams above it as normal scrolling console output, so you can scroll back through full startup/request history
 - **Live profile monitoring** — running a named profile shows real-time CPU/RAM/GPU usage and live generation speed (t/s); press `L` to flip between the settings summary and a full-screen scrolling log view
 - **Self-healing server starts** — automatically retries with `--no-mmap` or f16 K/V cache if the requested setting fails to start (e.g. quantized KV cache unsupported without flash attention), so a single incompatible setting doesn't stall the whole optimization run
 - **Historical comparison** — loads all past sessions and renders a ranked side-by-side table across every model and run; exportable as CSV or JSON
-- **Session persistence** — every run is saved to `sessions/` as JSON; reload any past session to view results or apply its best settings
+- **Session persistence** — every run is saved as JSON to a configurable sessions directory (defaults to `~/.llama-autosizer/sessions`); reload any past session to view results or apply its best settings
 - **Ready-to-use output** — final result includes the exact `llama-server` command to paste into a terminal or script
 - **Esc to go back** — every navigation menu supports Escape; Ctrl+C cleanly stops the server and exits
 
@@ -93,20 +95,19 @@ dotnet publish src/LlamaCppAutosizer -r linux-arm64 -c Release -o ./publish
 Launch the app and use the arrow-key menu (Esc goes back, Ctrl+C exits):
 
 ```
-1. Select Model Folder   — scan a directory for .gguf files and pick one
-2. Choose Profile        — Chat or Agentic (see below)
-3. Set llama-server Path — full path to llama-server or llama-server.exe
-4. Detect Hardware       — reads GPU VRAM, RAM, CPU cores
-5. Run Auto-Optimization — start the iterative benchmark loop
-6. Edit Settings Manually — override any parameter before or between runs
-7. Named Profiles        — run, rename, edit, or delete saved configurations
-8. TurboQuant Options    — set turbo KV cache types or quantize a model
-9. View / Load Sessions  — browse and reload past optimization runs
-H. Historical Comparison — ranked table across all models and sessions
+1. Choose Profile          — Chat or Agentic (see below)
+2. Detect Hardware         — reads GPU VRAM, RAM, CPU cores
+3. Run Auto-Optimization   — start the iterative benchmark loop
+4. Edit llama.cpp Settings Manually — override any parameter before or between runs
+5. Named Profiles          — run, rename, edit, or delete saved configurations
+6. View / Load Sessions    — browse and reload past optimization runs
+7. Settings                — model folder, llama-server path, profiles/sessions
+                              directories, TurboQuant options
+H. Historical Benchmark Comparison — ranked table across all models and sessions
 0. Exit
 ```
 
-Your `llama-server` path, last-used model folder, and selected profile are saved to `autosizer-config.json` so you only configure them once.
+The model folder scan happens the first time you need a model (or from Settings). Your `llama-server` path, last-used model folder, and selected profile are saved to `~/.llama-autosizer/settings.json` so you only configure them once.
 
 ---
 
@@ -122,7 +123,7 @@ Optimizes for agent loops and tool-calling workloads — high prompt-processing 
 
 ## Named Profiles
 
-After an optimization run (or after editing settings manually) you can save the configuration under a name. From menu option 7 you can:
+After an optimization run (or after editing settings manually) you can save the configuration under a name. From menu option 5 (Named Profiles) you can:
 
 - **Run** a saved profile — starts `llama-server` with that configuration and shows the endpoint URL (`http://127.0.0.1:8080/v1`), expected TG/PP speeds, key settings, and live CPU/RAM/GPU/generation-speed stats. Press `L` to switch to a full-screen scrolling log view, or any other key to stop the server.
 - **Edit** settings on a saved profile
@@ -154,21 +155,28 @@ At the end of a run the tool shows:
 - The ready-to-use `llama-server` command
 - Percentage improvement over the baseline
 
-Results are auto-saved to `sessions/<model>_<profile>_<timestamp>.json`. Use menu option H to compare across all past runs, or export the comparison as a CSV for external analysis.
+Results are auto-saved to `<sessions directory>/<model>_<profile>_<timestamp>.json`. Use menu option H to compare across all past runs, or export the comparison as a CSV for external analysis.
 
 ---
 
 ## Session Files
 
-```
-sessions/
-  Mistral-7B-Instruct_Chat_20260628_143200.json
-  Mistral-7B-Instruct_Agentic_20260628_151045.json
-  Llama-3.1-8B-Q4_K_M_Chat_20260629_090312.json
+By default, profiles and sessions live in a shared location under your home directory rather than the current working directory, so history persists no matter where you launch the tool from:
 
-profiles/
-  a1b2c3d4e5f6....json   ← named profiles saved from optimization runs
 ```
+~/.llama-autosizer/
+  settings.json          ← model folder, llama-server path, profile, TurboQuant server path
+
+  sessions/
+    Mistral-7B-Instruct_Chat_20260628_143200.json
+    Mistral-7B-Instruct_Agentic_20260628_151045.json
+    Llama-3.1-8B-Q4_K_M_Chat_20260629_090312.json
+
+  profiles/
+    a1b2c3d4e5f6....json   ← named profiles saved from optimization runs
+```
+
+Both the profiles and sessions directories can be pointed elsewhere from the Settings menu (option 7).
 
 Each session file contains the full iteration history, hardware snapshot, all benchmark results, and the best settings found.
 
@@ -176,10 +184,10 @@ Each session file contains the full iteration history, hardware snapshot, all be
 
 ## TurboQuant
 
-The TurboQuant menu (option 8) integrates with [llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant), a fork of llama.cpp that adds additional KV cache quantization types (`turbo4`, `turbo3`, `turbo2`, `turbo1`, `turbo8`).
+TurboQuant Options live under **Settings → TurboQuant Options** (menu option 7) and integrate with [llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant), a fork of llama.cpp that adds additional KV cache quantization types (`turbo4`, `turbo3`, `turbo2`, `turbo1`, `turbo8`).
 
-**Configure KV cache types** — sets `--cache-type-k turbo4 --cache-type-v turbo3` (or any combination) on the active settings. These are applied whenever you run a profile or optimization with the TurboQuant `llama-server`.
+**Set the TurboQuant `llama-server` path first** — point it at a folder path (the tool searches for `llama-server.exe` / `llama-server` inside it) or a direct path to the executable. Once set, it overrides the main llama-server path for every run. Until it's configured, the `turbo*` cache types stay hidden in every settings editor (manual settings, run-start override, saved-profile editor) so you can't accidentally pick one that silently no-ops against a stock server.
 
-**Quantize a model** — point to the folder containing the TurboQuant-built `llama-server`, select a quantization type and calibration options, and the tool runs the quantization and reports the size reduction.
+**Configure KV cache types** — once a TurboQuant server is set, sets `--cache-type-k turbo4 --cache-type-v turbo3` (or any combination) on the active settings. These are applied whenever you run a profile or optimization with the TurboQuant `llama-server`.
 
-The TurboQuant `llama-server` can be pointed to via a folder path (the tool searches for `llama-server.exe` / `llama-server` inside it) or a direct path to the executable.
+**Quantize a model** — select a quantization type and calibration options, and the tool runs the quantization and reports the size reduction; optionally switch your active model to the quantized output afterward.
