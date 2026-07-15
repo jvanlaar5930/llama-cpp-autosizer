@@ -291,6 +291,36 @@ public record class OptimizationProfile
             Prompt = "Complete the sequence and reply with only the next number: 2, 4, 8, 16, ...",
             AcceptableAnswers = ["32"],
         },
+        new()
+        {
+            Prompt = "What is 9 multiplied by 14? Reply with only the number.",
+            AcceptableAnswers = ["126"],
+        },
+        new()
+        {
+            Prompt = "How many days are in a leap year? Reply with only the number.",
+            AcceptableAnswers = ["366"],
+        },
+        new()
+        {
+            Prompt = "Which planet is closest to the sun? Reply with only the planet name.",
+            AcceptableAnswers = ["Mercury"],
+        },
+        new()
+        {
+            Prompt = "Alphabetically, which word comes first: zebra or apple? Reply with only that word.",
+            AcceptableAnswers = ["apple"],
+        },
+        new()
+        {
+            Prompt = "Complete the sequence and reply with only the next number: 1, 1, 2, 3, 5, 8, ...",
+            AcceptableAnswers = ["13"],
+        },
+        new()
+        {
+            Prompt = "How many hours are in three days? Reply with only the number.",
+            AcceptableAnswers = ["72"],
+        },
     ];
 
     // -------------------------------------------------------------------------
@@ -299,9 +329,11 @@ public record class OptimizationProfile
 
     public double ScoreResult(BenchmarkResult result)
     {
-        double tgScore = NormalizeRate(result.GenerationRate, lower: 5, upper: 80);
-        double ppScore = NormalizeRate(result.PromptProcessingRate, lower: 50, upper: 2000);
-        double ttftScore = NormalizeTtft(result.TimeToFirstTokenMs, worst: 5000, best: 200);
+        double tgScore = NormalizeRate(result.GenerationRate, lower: 5, upper: 300);
+        double ppScore = NormalizeRate(result.PromptProcessingRate, lower: 50, upper: 10000);
+        // TTFT here is the server-reported prompt-eval time (see BenchmarkService), typically
+        // 50–500 ms on GPU — bounds sized to that, not to full-response wall time.
+        double ttftScore = NormalizeTtft(result.TimeToFirstTokenMs, worst: 3000, best: 50);
         double qualityScore = result.QualityScore;
         double toolScore = result.ToolSuccessRate;
         double agentLoopScore = result.AgentLoopScore;
@@ -316,8 +348,12 @@ public record class OptimizationProfile
             0, 1);
     }
 
+    // Log-scale so resolution is preserved across the whole range: on fast hardware a linear
+    // scale with a low ceiling clamps every config to 1.0 and the optimizer goes blind to
+    // real speed differences (which then read as "no improvement" and end the run early).
     static double NormalizeRate(double actual, double lower, double upper)
-        => Math.Clamp((actual - lower) / (upper - lower), 0, 1);
+        => actual <= lower ? 0
+         : Math.Clamp(Math.Log(actual / lower) / Math.Log(upper / lower), 0, 1);
 
     static double NormalizeTtft(double actualMs, double worst, double best)
         => Math.Clamp((worst - actualMs) / (worst - best), 0, 1);

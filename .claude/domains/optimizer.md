@@ -22,7 +22,7 @@ Core feature of the app: automatically finds the best `llama-server` settings fo
    - Rejects LLM suggestions that reproduce an already-tested config (`RecreatesTestedConfig`, uses `LlamaSettings.Fingerprint()`), falling back to heuristic in that case.
    - Heuristic fallback walks `ExplorationOrder`: `GpuLayers, FlashAttention, CacheTypeK, CacheTypeV, BatchSize, UBatchSize, ContextSize, Threads, Mlock`.
 3. **Apply and re-benchmark** — settings cloned + mutated with the one parameter change, server restarted (self-healing retry if the new setting fails to start), benchmarked again, scored.
-4. **Convergence check** — stops when score improvement drops below `OptimizationOptions.ConvergenceThreshold` (default 0.01) for `ConvergencePatience` consecutive rounds (default 3), or `MaxIterations` is hit (default 20). `VerifyBestAtEnd` (default true) re-runs the best config once more before finalizing.
+4. **Convergence check** — stops when score improvement drops below `OptimizationOptions.ConvergenceThreshold` (default 0.01) for `ConvergencePatience` consecutive rounds (default 3), or `MaxIterations` is hit (default 20). Capability gains (context/experts) and quality-metric gains (QualityScore/ToolSuccessRate/AgentLoopScore, ≥ 0.05) also reset the patience counter; duplicate-config skips do not consume patience. When the final-push LLM says DONE, the loop only ends if the heuristic pool is also exhausted. `VerifyBestAtEnd` (default true) re-runs the best config once more before finalizing (Agentic verification always includes the repetition stress test).
 5. **Persist** — `SessionPersistenceService` writes the completed `OptimizationSession` to `sessions/<model>_<profile>_<timestamp>.json`.
 
 ## Data and State
@@ -39,8 +39,15 @@ Core feature of the app: automatically finds the best `llama-server` settings fo
 
 Needs verification — no automated tests exist for the optimizer loop. Validate by running a full optimization (`dotnet run --project src/LlamaCppAutosizer`, menu option 5) against a real model and checking the resulting `sessions/*.json` and printed summary/command.
 
+## Quality-Tuning Phase
+
+Once the best config's TG rate clears `TargetTgSpeed × 1.1` (buffer avoids phase-flipping on noise), the heuristic recommender switches to quality tuning, in order: revert aggressive KV-cache quant (q4/q5 → q8_0; q8_0 → f16 only with ≥ 15 t/s headroom), escalate anti-loop samplers (DRY → 1.05, then repeat-penalty → 1.15) when quality/agent-loop scores show loop symptoms, enable thinking mode (Agentic + thinking-capable models), restore MoE experts, then grow context. Both LLM prompts describe the same phase. The Agentic profile auto-runs the repetition stress test each iteration once the TG target is met, and `BenchmarkService` folds a graded distinct-trigram "repetition health" factor into QualityScore so near-loops are visible before the binary loop detector fires.
+
 ## Known Gotchas
 
 - Always read `LlamaServerService.LastEffectiveSettings` after a start attempt rather than assuming the requested `LlamaSettings` took effect — self-healing retries silently revert unsupported values.
 - Adding a new tunable parameter requires three coordinated edits: `LlamaSettings` (property + `ToServerArgs`/`Fingerprint`/`Summary`), `RecommendationService.ExplorationOrder` (heuristic order), and wherever the LLM-recommendation JSON schema/prompt enumerates valid parameter names — missing one causes the optimizer to silently never explore the new parameter via one of the two recommendation paths.
-- `OptimizationProfile.ScoreResult()` weights differ significantly between Chat and Agentic — a change to scoring normalization (`NormalizeRate`/`NormalizeTtft` bounds) affects both profiles; check both when tuning scoring behavior.
+- `OptimizationProfile.ScoreResult()` weights differ significantly between Chat and Agentic — a change to scoring normalization (`NormalizeRate`/`NormalizeTtft` bounds) affects both profiles; check both when tuning scoring behavior. `NormalizeRate` is log-scale (TG 5–300, PP 50–10000) specifically so fast hardware doesn't saturate every config to 1.0 and fake "no improvement" convergence.
+- `TimeToFirstTokenMs` is the **server-reported prompt-eval time** (`timings.prompt_ms`), not wall clock — the wall-clock tuple from `CompleteAsync` covers the entire non-streaming response and must not be used as TTFT (it double-counts generation speed).
+- The MoE expert-count override must use the arch-prefixed GGUF key: `--override-kv {arch}.expert_used_count=int:N`, with `{arch}` read via `GgufMetadata.GetArchitecture()` (e.g. `qwen3moe`). Wrong/unprefixed keys are silently ignored by llama-server — verify in the startup log (`n_expert_used = N`).
+- Thinking mode cannot be toggled via `--override-kv` (it's a chat-template variable, not GGUF metadata). Use `--chat-template-kwargs {"enable_thinking":...}` and, when disabling, also `--reasoning-budget 0`.

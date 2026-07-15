@@ -82,8 +82,23 @@ public class LlamaSettings
         if (Mlock) args.Add("--mlock");
         if (CacheTypeK is not null) { args.Add("--cache-type-k"); args.Add(CacheTypeK); }
         if (CacheTypeV is not null) { args.Add("--cache-type-v"); args.Add(CacheTypeV); }
-        if (MoeExpertUsed.HasValue) { args.Add("--override-kv"); args.Add($"tokenizer.ggml.n_expert_used=int:{MoeExpertUsed.Value}"); }
-        if (ThinkingEnabled.HasValue) { args.Add("--override-kv"); args.Add($"tokenizer.ggml.enable_thinking=bool:{ThinkingEnabled.Value.ToString().ToLower()}"); }
+        if (MoeExpertUsed.HasValue)
+        {
+            // The GGUF key is arch-prefixed (e.g. qwen3moe.expert_used_count) — an unprefixed
+            // or wrong key is silently ignored by llama-server, making the override a no-op.
+            string arch = Services.GgufMetadata.GetArchitecture(modelPath) ?? "llama";
+            args.Add("--override-kv");
+            args.Add($"{arch}.expert_used_count=int:{MoeExpertUsed.Value}");
+        }
+        if (ThinkingEnabled.HasValue)
+        {
+            // --override-kv can't toggle thinking (enable_thinking is a chat-template variable,
+            // not GGUF metadata). Pass it as a template kwarg; when disabling, also zero the
+            // reasoning budget — some models keep emitting thinking blocks on kwargs alone.
+            args.Add("--chat-template-kwargs");
+            args.Add($"{{\"enable_thinking\":{ThinkingEnabled.Value.ToString().ToLower()}}}");
+            if (!ThinkingEnabled.Value) { args.Add("--reasoning-budget"); args.Add("0"); }
+        }
         if (DefragThreshold >= 0) { args.Add("--defrag-thold"); args.Add(DefragThreshold.ToString("F2")); }
         if (RopeScaling is not null) { args.Add("--rope-scaling"); args.Add(RopeScaling); }
         if (RopeFreqBase.HasValue) { args.Add("--rope-freq-base"); args.Add(RopeFreqBase.Value.ToString()); }

@@ -112,8 +112,18 @@ public class OptimizerService(
                     change = await recommender.GetFinalPushAsync(session, profile, hw, ct);
                     if (change is null)
                     {
-                        session.CompletionReason = "LLM confirmed no further improvements possible";
-                        break;
+                        // LLM said DONE — but a single DONE against a no-improvement history
+                        // shouldn't end the run while the heuristic pool still has untried
+                        // moves (e.g. the quality-phase steps). Only stop when both agree.
+                        change = recommender.GetHeuristicRecommendation(session, profile, hw);
+                        if (change is null)
+                        {
+                            session.CompletionReason = "LLM confirmed no further improvements possible";
+                            break;
+                        }
+                        logger.LogInformation(
+                            "LLM said DONE but heuristic still has an untried move — continuing with {Change}",
+                            change.Describe());
                     }
                 }
                 else
@@ -219,7 +229,9 @@ public class OptimizerService(
                     session.AddIteration(duplicate);
                     await persistence.SaveAsync(session);
                     yield return duplicate;
-                    consecutiveNonImprovements++;
+                    // Deliberately NOT counted toward the non-improvement streak: no new
+                    // measurement happened, so it says nothing about convergence — counting
+                    // it burned patience and ended runs early. MaxIterations still bounds it.
                     continue;
                 }
 
@@ -227,10 +239,15 @@ public class OptimizerService(
                 onPhase?.Invoke($"Iteration {iter}/{options.MaxIterations} — running benchmark…");
                 BenchmarkResult? iterResult = null;
                 string? benchFailReason = null;
+                // Once the speed target is met, Agentic runs get the repetition stress test
+                // automatically — it's the direct detector of the quant-induced loops the
+                // quality phase is tuning against, and short prompts rarely trigger them.
+                bool autoStressTest = profile.Type == ProfileType.Agentic
+                    && (session.BestResult?.GenerationRate ?? 0) >= session.TargetTgSpeed;
                 try
                 {
                     iterResult = await benchmarks.RunAsync(nextSettings, modelPath, profile, ct,
-                        options.IncludeRepetitionStressTest, onPhase);
+                        options.IncludeRepetitionStressTest || autoStressTest, onPhase);
                     iterResult.CompositeScore = profile.ScoreResult(iterResult);
                 }
                 catch (OperationCanceledException)
@@ -281,12 +298,14 @@ public class OptimizerService(
 
                 // ── Track non-improvement streak ──────────────────────────────
                 // Becoming the anchor only counts as progress when the gain is meaningful:
-                // a capability gain, or a composite gain of at least ConvergenceThreshold.
-                // Sub-threshold gains are indistinguishable from benchmark noise, so they
-                // keep the convergence counter running even though the anchor advanced.
+                // a capability gain, a quality gain, or a composite gain of at least
+                // ConvergenceThreshold. Sub-threshold composite gains are indistinguishable
+                // from benchmark noise, so they keep the convergence counter running even
+                // though the anchor advanced.
                 bool meaningfulImprovement = iteration.IsBestSoFar &&
                     (prevAnchor is null
                      || HasCapabilityGain(iteration, prevAnchor)
+                     || HasQualityGain(iteration, prevAnchor)
                      || iteration.Result.CompositeScore - prevAnchor.Result.CompositeScore
                             >= options.ConvergenceThreshold);
                 if (meaningfulImprovement)
@@ -321,8 +340,11 @@ public class OptimizerService(
                     await StartServerAsync(serverExecutable, modelPath, verifySettings, options.Port, ct);
 
                     onPhase?.Invoke("Verifying best configuration — re-running benchmark…");
+                    // Agentic verification always includes the stress test: the champion is
+                    // about to be recommended for real agent workloads, so a latent loop
+                    // tendency must surface here rather than in production use.
                     var verifyResult = await benchmarks.RunAsync(verifySettings, modelPath, profile, ct,
-                        options.IncludeRepetitionStressTest, onPhase);
+                        options.IncludeRepetitionStressTest || profile.Type == ProfileType.Agentic, onPhase);
                     verifyResult.CompositeScore = profile.ScoreResult(verifyResult);
 
                     MergeVerification(champ, verifyResult, profile);
@@ -384,6 +406,16 @@ public class OptimizerService(
         return current.Result.QualityScore >= OptimizationSession.MinHealthyQuality
             && previous.Result.QualityScore < OptimizationSession.MinHealthyQuality;
     }
+
+    // Quality-phase moves (KV-quant reversal, sampler escalation, thinking mode) often cost
+    // speed, so their composite delta is flat or negative — but a real gain in any quality
+    // metric is exactly the progress that phase exists to make, and must reset the patience
+    // counter or the run ends before quality tuning gets anywhere.
+    private const double QualityGainEpsilon = 0.05;
+    private static bool HasQualityGain(OptimizationIteration current, OptimizationIteration previous)
+        => current.Result.QualityScore    - previous.Result.QualityScore    >= QualityGainEpsilon
+        || current.Result.ToolSuccessRate - previous.Result.ToolSuccessRate >= QualityGainEpsilon
+        || current.Result.AgentLoopScore  - previous.Result.AgentLoopScore  >= QualityGainEpsilon;
 
     // Folds a verification re-run into the champion's reported metrics: rates and latencies
     // are averaged (two samples beat one), quality-style scores take the worse of the two
