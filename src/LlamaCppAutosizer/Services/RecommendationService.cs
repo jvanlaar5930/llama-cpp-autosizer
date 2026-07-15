@@ -7,6 +7,7 @@ namespace LlamaCppAutosizer.Services;
 
 public class RecommendationService(
     LlamaServerService server,
+    CloudAdvisorService cloudAdvisor,
     ILogger<RecommendationService> logger)
 {
     private static readonly JsonSerializerOptions JsonOpts = new()
@@ -32,7 +33,39 @@ public class RecommendationService(
         HardwareInfo hardware,
         CancellationToken ct = default)
     {
-        // Try LLM first (it has context we can't express in heuristics)
+        // Cloud advisor first when configured — a frontier model reasons over the full
+        // history far better than the (often heavily quantized) model under test, and it
+        // works even while the local server is down. Failure falls through to the local LLM.
+        if (cloudAdvisor.IsConfigured && session.Iterations.Count >= 1)
+        {
+            try
+            {
+                var prompt = BuildRecommendationPrompt(session, profile, hardware);
+                string? content = await cloudAdvisor.CompleteAsync(prompt, ct);
+                var cloudRec = content is null ? null
+                    : Retag(ParseLlmResponse(content, session.BestSettings!), "claude");
+                if (cloudRec is not null && RecreatesTestedConfig(session, cloudRec))
+                {
+                    logger.LogInformation(
+                        "Cloud advisor suggested {Param} = {Val}, but that configuration was already benchmarked — falling back",
+                        cloudRec.Parameter, cloudRec.NewValue);
+                    cloudRec = null;
+                }
+                if (cloudRec is not null)
+                {
+                    logger.LogInformation("Cloud advisor recommended: {Param} = {Val} — {Reason}",
+                        cloudRec.Parameter, cloudRec.NewValue, cloudRec.Reasoning);
+                    return cloudRec;
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                logger.LogDebug("Cloud advisor recommendation failed, trying local LLM: {Msg}", ex.Message);
+            }
+        }
+
+        // Local LLM next (it has context we can't express in heuristics)
         if (server.IsRunning && session.Iterations.Count >= 1)
         {
             try
@@ -81,12 +114,30 @@ public class RecommendationService(
         HardwareInfo hardware,
         CancellationToken ct = default)
     {
+        var prompt = BuildFinalPushPrompt(session, profile, hardware);
+
+        // Cloud advisor first when configured — its answer is authoritative (including an
+        // explicit DONE); only a failed call falls through to the local LLM.
+        if (cloudAdvisor.IsConfigured)
+        {
+            try
+            {
+                string? content = await cloudAdvisor.CompleteAsync(prompt, ct);
+                if (content is not null)
+                    return ProcessFinalPushContent(content, session, profile, hardware, "claude-push");
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                logger.LogDebug("Cloud advisor final-push failed, trying local LLM: {Msg}", ex.Message);
+            }
+        }
+
         if (!server.IsRunning)
             return GetHeuristicRecommendation(session, profile, hardware);
 
         try
         {
-            var prompt = BuildFinalPushPrompt(session, profile, hardware);
             var (response, _) = await server.CompleteAsync(new CompletionRequest
             {
                 Prompt = prompt,
@@ -95,34 +146,7 @@ public class RecommendationService(
                 Stop = ["\n\n", "```"],
             }, ct);
 
-            var content = response.Content.Trim();
-
-            // If the LLM responds with "DONE" and no JSON, it's saying nothing more to try
-            bool hasDone = content.Contains("DONE", StringComparison.OrdinalIgnoreCase);
-            bool hasJson = content.Contains('{') && content.Contains('}');
-            if (hasDone && !hasJson) return null;
-
-            var change = ParseLlmResponse(content, session.BestSettings!);
-            if (change is null) return null;
-
-            if (RecreatesTestedConfig(session, change))
-            {
-                logger.LogInformation(
-                    "Final-push suggestion {Change} recreates an already-benchmarked configuration — falling back to heuristic",
-                    change.Describe());
-                return GetHeuristicRecommendation(session, profile, hardware);
-            }
-
-            // Tag it so the UI can show it as a "final push" iteration
-            return new ParameterChange
-            {
-                Parameter = change.Parameter,
-                OldValue = change.OldValue,
-                NewValue = change.NewValue,
-                Reasoning = change.Reasoning,
-                Source = "llm-push",
-                Combined = change.Combined,
-            };
+            return ProcessFinalPushContent(response.Content, session, profile, hardware, "llm-push");
         }
         catch (Exception ex)
         {
@@ -131,6 +155,51 @@ public class RecommendationService(
             return GetHeuristicRecommendation(session, profile, hardware);
         }
     }
+
+    // Shared handling for final-push responses from either recommender. Null means "nothing
+    // more to try" (explicit DONE or unparseable) — the optimizer then checks the heuristic
+    // pool before ending the run.
+    private ParameterChange? ProcessFinalPushContent(
+        string content,
+        OptimizationSession session,
+        OptimizationProfile profile,
+        HardwareInfo hardware,
+        string source)
+    {
+        content = content.Trim();
+
+        // A "DONE" with no JSON is the recommender saying nothing more to try
+        bool hasDone = content.Contains("DONE", StringComparison.OrdinalIgnoreCase);
+        bool hasJson = content.Contains('{') && content.Contains('}');
+        if (hasDone && !hasJson) return null;
+
+        var change = ParseLlmResponse(content, session.BestSettings!);
+        if (change is null) return null;
+
+        if (RecreatesTestedConfig(session, change))
+        {
+            logger.LogInformation(
+                "Final-push suggestion {Change} recreates an already-benchmarked configuration — falling back to heuristic",
+                change.Describe());
+            return GetHeuristicRecommendation(session, profile, hardware);
+        }
+
+        // Tag it so the UI can show it as a "final push" iteration and its origin
+        return Retag(change, source);
+    }
+
+    // Re-tags a parsed change with the recommender that produced it (ParseLlmResponse
+    // defaults to "llm").
+    private static ParameterChange? Retag(ParameterChange? change, string source)
+        => change is null ? null : new ParameterChange
+        {
+            Parameter = change.Parameter,
+            OldValue = change.OldValue,
+            NewValue = change.NewValue,
+            Reasoning = change.Reasoning,
+            Source = source,
+            Combined = change.Combined,
+        };
 
     // -------------------------------------------------------------------------
     // LLM-based recommendation

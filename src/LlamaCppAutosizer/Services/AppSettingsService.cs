@@ -17,6 +17,15 @@ public class AppSettings
     // anywhere else in the UI — without it, picking those types would silently do nothing
     // (or fail to start) since stock llama-server doesn't recognize them.
     public string? TurboQuantServerExecutable { get; set; }
+
+    // Cloud advisor (optional): command for the Claude Code CLI used as the optimizer's
+    // recommender in place of the local model under test. Null/empty = disabled — the
+    // optimizer falls back to asking the local LLM, then heuristics. Uses the user's
+    // existing Claude login/subscription; no API key is stored here.
+    public string? CloudAdvisorCommand { get; set; }
+    // Model passed to the CLI via --model (e.g. "claude-opus-4-8", "sonnet").
+    // Null/empty = let the CLI use its default model.
+    public string? CloudAdvisorModel { get; set; }
 }
 
 public class AppSettingsService

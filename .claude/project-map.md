@@ -39,7 +39,7 @@ README.md                    primary user-facing docs — usage, profiles, optim
 
 See `.claude/domains/` for details:
 
-- **Optimization loop** (`OptimizerService`, `RecommendationService`, `BenchmarkService`) — see [`.claude/domains/optimizer.md`](domains/optimizer.md)
+- **Optimization loop** (`OptimizerService`, `RecommendationService`, `BenchmarkService`, optional `CloudAdvisorService` — Claude CLI as recommender with local-LLM fallback) — see [`.claude/domains/optimizer.md`](domains/optimizer.md)
 - **llama-server process/API control** (`LlamaServerService`) — spawns/kills the server subprocess, calls its HTTP API (`/completion`, `/v1/chat/completions`, `/health`)
 - **Hardware detection** (`HardwareDetectionService`) — VRAM/RAM/CPU scan, Windows (`wmic`/`System.Management`/P-Invoke) and Linux (`/proc/*`) paths, plus `nvidia-smi`/`rocm-smi`
 - **Named profiles & sessions** (`ProfileLibraryService`, `SessionPersistenceService`) — persistence of saved configs and run history to `profiles/` and `sessions/`
