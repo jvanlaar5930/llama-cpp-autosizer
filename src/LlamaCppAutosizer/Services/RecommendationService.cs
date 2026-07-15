@@ -254,10 +254,10 @@ FULL OPTIMIZATION HISTORY:
 
 GOAL: Target generation speed is {{session.TargetTgSpeed:F0}}t/s.
 - Below {{session.TargetTgSpeed:F0}}t/s: prioritize whatever raises TG speed most (GPU layers, flash-attn, mmap, KV cache quantization, batch size).
-- At or above {{session.TargetTgSpeed:F0}}t/s with only modest headroom: prefer growing ContextSize (in +16,384 steps) for more capability — it's free upside that doesn't cost the speed already banked.
-- Well above {{session.TargetTgSpeed:F0}}t/s (lots of headroom, e.g. {{session.TargetTgSpeed + LotsOfHeadroomAboveTarget:F0}}t/s+): it's fine to give back some speed for quality — e.g. restore MoE active-expert count toward the model default — as long as TG stays at/above {{session.TargetTgSpeed:F0}}t/s.
+- At or above {{session.TargetTgSpeed * QualityPhaseBufferFactor:F0}}t/s (target met with buffer): switch to QUALITY TUNING and spend the spare speed, in this order: (1) revert aggressive KV cache quantization (q4/q5-class → q8_0; q8_0 → f16 only with a lot of headroom) — low-bit KV quant is a common cause of repetition loops and degraded tool calls; (2) if quality/tool/agent-loop scores are below ~0.9, strengthen anti-loop samplers (DryMultiplier, RepeatPenalty); (3) for agentic profiles on thinking-capable models, enable ThinkingEnabled; (4) grow ContextSize (in +16,384 steps) for more capability.
+- Well above {{session.TargetTgSpeed:F0}}t/s (lots of headroom, e.g. {{session.TargetTgSpeed + LotsOfHeadroomAboveTarget:F0}}t/s+): it's fine to give back more speed for quality — e.g. restore MoE active-expert count toward the model default — as long as TG stays at/above {{session.TargetTgSpeed:F0}}t/s.
 - If the quality score has cratered on the current best (a strong sign of a degenerate repetition loop like "is is is is..."), prioritize RepeatPenalty (e.g. 1.1–1.3), RepeatLastN (e.g. 256), or DryMultiplier (e.g. 0.8) over speed tuning — an unusable output is worse than a faster one.
-RULE: If a parameter made things worse, try something else OR a different value for it. Never suggest changing cache-type-k/cache-type-v purely to "improve quality" — that's a speed/VRAM lever, not a quality one.
+RULE: If a parameter made things worse, try something else OR a different value for it. Below the speed target, treat cache-type-k/cache-type-v purely as a speed/VRAM lever; at/above the target, reverting quantized KV cache toward q8_0/f16 to protect quality is encouraged.
 RULE: Never re-suggest a parameter=value pair from the history above unless the best settings have changed since it was tried — recreating an already-benchmarked configuration wastes an iteration and will be rejected.
 
 Valid parameters and example values:
@@ -333,9 +333,9 @@ ALREADY TRIED (do NOT repeat any of these parameter=value pairs — recreating a
 
 TARGET: {{session.TargetTgSpeed:F0}}t/s generation speed. Current TG is {{best.GenerationRate:F0}}t/s.
 {{(best.GenerationRate >= session.TargetTgSpeed + LotsOfHeadroomAboveTarget
-    ? "We're well above target — it's fine to trade some of that speed back for quality (e.g. restore MoE active-expert count) as long as TG stays at/above the target."
-    : best.GenerationRate >= session.TargetTgSpeed
-        ? "We're at/above target — prefer growing ContextSize (in +16,384 steps, up to 131072) over further speed cuts."
+    ? "We're well above target — trade that spare speed for quality: revert quantized KV cache toward q8_0/f16, restore MoE active-expert count, enable thinking mode (agentic), or grow ContextSize — as long as TG stays at/above the target."
+    : best.GenerationRate >= session.TargetTgSpeed * QualityPhaseBufferFactor
+        ? "We're above target with buffer — QUALITY TUNING phase: prefer reverting aggressive KV cache quantization, strengthening anti-loop samplers if quality/tool scores dip, enabling thinking mode (agentic), or growing ContextSize (+16,384 steps, up to 131072) over further speed cuts."
         : "We're below target — prioritize whatever raises TG speed most.")}}
 
 We need a fresh approach. Think carefully about:
@@ -343,11 +343,11 @@ We need a fresh approach. Think carefully about:
 - Toggling mmap on/off — hasn't necessarily been tried yet and can meaningfully shift TG speed
 - Context sizes not yet tried, in +16,384 steps (larger if VRAM permits, up to 131072)
 - Combinations we haven't explored (e.g. flash-attn + smaller ubatch) — you may change TWO parameters at once via the optional "parameter2"/"value2" fields
-- KV cache quantization levels not yet tried (this is a speed/VRAM lever, not a quality one — don't suggest it purely for quality)
+- KV cache quantization levels not yet tried (below target it's a speed/VRAM lever; above target, reverting toward q8_0/f16 protects quality)
 - Thread count tuning for CPU-bound operations
 - Mlock if the model fits in RAM
 - Ubatch vs batch ratios
-- If quality has cratered (likely a repetition loop): RepeatPenalty, RepeatLastN, or DryMultiplier haven't necessarily been tried yet{{moeParam}}{{thinkingParam}}
+- If quality, tool, or agent-loop scores are weak (a sign of repetition loops or degraded reasoning): RepeatPenalty, RepeatLastN, or DryMultiplier escalation, or reverting KV quant{{moeParam}}{{thinkingParam}}
 
 If you genuinely believe no further optimization is possible given what has been tried and the hardware constraints, respond with exactly:
 DONE
@@ -517,6 +517,9 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
     // How far above the target counts as "a lot" of headroom — worth actively giving back
     // some speed for quality (e.g. restoring MoE experts), rather than just growing context.
     private const double LotsOfHeadroomAboveTarget = 15.0;
+    // Quality-tuning phase starts at target × this factor, so a config sitting exactly on
+    // the target doesn't flip between speed and quality phases on benchmark noise.
+    private const double QualityPhaseBufferFactor = 1.1;
     private const int ContextStep = 16384;
     // Hard ceiling for context growth regardless of profile default — most models top out
     // well below this, and a failed start here just teaches the optimizer where the wall is.
@@ -578,15 +581,57 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
         // config that still clears this bar rather than the highest composite score.
         double targetTgSpeed = session.TargetTgSpeed;
         double tgHeadroom = best.GenerationRate - targetTgSpeed;
-        bool aboveSpeedTarget = tgHeadroom >= 0;
+        // Quality phase entered with a buffer above the target so benchmark noise doesn't
+        // flip the optimizer between speed-chasing and quality-tuning across iterations.
+        bool inQualityPhase = best.GenerationRate >= targetTgSpeed * QualityPhaseBufferFactor;
         bool lotsOfSpeedHeadroom = tgHeadroom >= LotsOfHeadroomAboveTarget;
 
-        // ── Speed target already met: spend the headroom on quality instead of chasing
-        // more raw speed. A lot of headroom → actively give some back for quality (more MoE
-        // experts). Any headroom → keep growing context, since more context is free capability
-        // that doesn't cost the speed we've already banked.
-        if (aboveSpeedTarget)
+        // ── Speed target met (with buffer): spend the headroom on quality instead of chasing
+        // more raw speed. Tooling quality comes first — reverting aggressive KV quant and
+        // strengthening anti-loop samplers directly target the repetition loops and degraded
+        // tool calls that low-bit quants produce — then capability (experts, context).
+        if (inQualityPhase)
         {
+            // 1. Undo aggressive KV-cache quantization: q4/q5-class → q8_0; with a lot of
+            //    headroom, q8_0 → f16. This is the only path that ever reverses KV quant.
+            foreach (var (param, current) in new[]
+                     { ("CacheTypeK", bestSettings.CacheTypeK), ("CacheTypeV", bestSettings.CacheTypeV) })
+            {
+                string? revert = KvQuantRevertTarget(current, lotsOfSpeedHeadroom);
+                if (revert is not null && !AlreadyTriedValue(session, param, revert))
+                    return Change(param, current ?? "f16", revert,
+                        $"TG={best.GenerationRate:F0}t/s clears the {targetTgSpeed:F0}t/s target — " +
+                        $"reverting {param} {current} → {revert} to protect output quality");
+            }
+
+            // 2. Strengthen anti-loop samplers, but only when there's an actual loop/quality
+            //    signal — baseline already ships sane defaults (1.1/256/0.8).
+            bool loopSignal =
+                (best.Notes?.Contains("Repetition loop", StringComparison.OrdinalIgnoreCase) ?? false)
+                || best.QualityScore < 0.9
+                || (profile.Type == ProfileType.Agentic && best.AgentLoopScore < 0.9);
+            if (loopSignal)
+            {
+                if ((bestSettings.DryMultiplier ?? 0f) < 1.05f && !AlreadyTriedValue(session, "DryMultiplier", 1.05f))
+                    return Change("DryMultiplier", bestSettings.DryMultiplier?.ToString() ?? "server default", 1.05f,
+                        "Quality/agent-loop score shows loop symptoms — strengthening the DRY sampler");
+
+                if ((bestSettings.RepeatPenalty ?? 1.0f) < 1.15f && !AlreadyTriedValue(session, "RepeatPenalty", 1.15f))
+                    return Change("RepeatPenalty", bestSettings.RepeatPenalty?.ToString() ?? "server default", 1.15f,
+                        "Loop symptoms persist — raising repeat-penalty a step");
+            }
+
+            // 3. Thinking models on agentic workloads: spend banked speed on reasoning,
+            //    which measurably improves tool-call and agent-loop correctness.
+            if (profile.Type == ProfileType.Agentic
+                && LlamaSettings.IsThinkingModel(session.ModelPath)
+                && bestSettings.ThinkingEnabled != true
+                && !AlreadyTriedValue(session, "ThinkingEnabled", true))
+                return Change("ThinkingEnabled", bestSettings.ThinkingEnabled ?? false, true,
+                    $"TG={best.GenerationRate:F0}t/s clears the {targetTgSpeed:F0}t/s target — " +
+                    "enabling thinking mode to improve tool-call correctness");
+
+            // 4. A lot of headroom → actively give some back for quality (more MoE experts).
             if (lotsOfSpeedHeadroom && isMoe && bestSettings.MoeExpertUsed.HasValue)
             {
                 bool alreadyRestoredDefault = AppliedChanges(session).Any(c =>
@@ -597,6 +642,7 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
                         "restoring full expert count for better quality");
             }
 
+            // 5. Grow context — free capability that doesn't cost the speed already banked.
             int? qualityCtx = NextContextStep(session, bestSettings);
             if (qualityCtx is not null)
                 return Change("ContextSize", bestSettings.ContextSize, qualityCtx.Value,
@@ -728,6 +774,22 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
 
         return alreadyTried ? null : nextCtx;
     }
+
+    // Quality-phase KV cache revert target: low-bit quants step up to q8_0; q8_0 itself only
+    // goes back to f16 when there's a lot of speed headroom to spend. null = nothing to revert.
+    private static string? KvQuantRevertTarget(string? current, bool lotsOfSpeedHeadroom) => current switch
+    {
+        null or "f16" or "bf16" => null,
+        "q8_0" or "turbo8" => lotsOfSpeedHeadroom ? "f16" : null,
+        _ => "q8_0",
+    };
+
+    // True if this exact parameter=value pair has been applied at some point this session
+    // (compared as strings — values arrive as int/float/bool/string depending on the source).
+    private static bool AlreadyTriedValue(OptimizationSession session, string parameter, object? value) =>
+        AppliedChanges(session).Any(c =>
+            c.Parameter == parameter &&
+            string.Equals(c.NewValue?.ToString(), value?.ToString(), StringComparison.OrdinalIgnoreCase));
 
     // Every individual parameter change applied this session, with combined changes flattened.
     private static IEnumerable<ParameterChange> AppliedChanges(OptimizationSession session) =>

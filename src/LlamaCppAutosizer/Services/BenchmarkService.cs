@@ -64,9 +64,10 @@ public class BenchmarkService(
             if (runTiming is not null) timings.Add(runTiming);
         }
 
-        // Opt-in long-form run so the repetition-loop check below has enough tokens to
-        // actually catch a degenerate config — short benchmark prompts rarely run long
-        // enough to reveal it even though real long-form usage frequently does.
+        // Long-form run so the repetition-loop check below has enough tokens to actually
+        // catch a degenerate config — short benchmark prompts rarely run long enough to
+        // reveal it even though real long-form usage frequently does. Opt-in via options,
+        // and auto-enabled by the optimizer for Agentic runs once the TG target is met.
         if (includeRepetitionStressTest && !string.IsNullOrWhiteSpace(profile.StressTestPrompt))
         {
             ct.ThrowIfCancellationRequested();
@@ -138,7 +139,7 @@ public class BenchmarkService(
     {
         try
         {
-            var (response, ttftMs) = await server.CompleteAsync(new CompletionRequest
+            var (response, _) = await server.CompleteAsync(new CompletionRequest
             {
                 Prompt = prompt,
                 NPredict = maxTokens,
@@ -156,7 +157,10 @@ public class BenchmarkService(
                 PredictedMs = t.PredictedMs,
                 PredictedPerSecond = t.PredictedPerSecond,
                 TotalMs = t.TotalMs,
-                TimeToFirstTokenMs = ttftMs,
+                // Server-reported prompt-eval time is the config-sensitive component of TTFT.
+                // The wall-clock tuple value covers the whole non-streaming response (≈ total
+                // time), which would double-count generation speed in the composite score.
+                TimeToFirstTokenMs = t.PromptMs,
                 GeneratedText = response.Content,
             };
             result.IndividualRuns.Add(timing);
@@ -479,12 +483,46 @@ public class BenchmarkService(
         // Penalize very slow generation as it degrades perceived quality
         double speedPenalty = result.GenerationRate < 1.0 ? 0.5 : 1.0;
 
-        double fluency = completionRate * lengthScore * speedPenalty;
+        // Graded repetition signal: the binary loop check above only fires on catastrophic
+        // loops; near-loops (dropping distinct-trigram ratio) depress quality smoothly here,
+        // giving the optimizer's anti-loop sampler escalation a measurable gradient. The
+        // worst run dominates — one loopy output means the config can produce them.
+        double repetitionHealth = timings.Min(t => RepetitionHealth(t.GeneratedText));
+        if (repetitionHealth < 0.8)
+            result.Notes = (result.Notes is null ? "" : result.Notes + " ") +
+                $"Elevated repetition in generated output (health {repetitionHealth:P0}).";
+
+        double fluency = completionRate * lengthScore * speedPenalty * repetitionHealth;
 
         // Accuracy carries most of the weight: fluency is near-1.0 for almost every config,
         // so without it the quality metric can't distinguish a healthy config from one that
         // quantization/expert-reduction has made subtly wrong.
         return 0.4 * fluency + 0.6 * result.AccuracyScore;
+    }
+
+    // Distinct-trigram ratio over the tail of the output, mapped to a 0–1 health score.
+    // Natural prose scores ~1.0 (repeated trigrams are rare in a 200-word window); text
+    // sliding into a loop drops sharply well before the binary detector below would fire.
+    private static double RepetitionHealth(string text)
+    {
+        var words = text.Split((char[]?)null!, StringSplitOptions.RemoveEmptyEntries);
+        if (words.Length < 24) return 1.0;   // too short to judge
+
+        const int Window = 200;
+        int start = Math.Max(0, words.Length - Window);
+        var distinct = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        int total = 0;
+        for (int i = start; i + 2 < words.Length; i++)
+        {
+            // Space-joined is collision-free: words are whitespace-split so contain no spaces.
+            distinct.Add($"{words[i]} {words[i + 1]} {words[i + 2]}");
+            total++;
+        }
+        if (total == 0) return 1.0;
+
+        // ratio ≥ 0.6 → healthy (1.0); ratio ≤ 0.3 → fully degenerate (0.0)
+        double ratio = (double)distinct.Count / total;
+        return Math.Clamp((ratio - 0.3) / 0.3, 0, 1);
     }
 
     // Detects decoding loops where a short word or phrase (1-3 words) repeats back-to-back
