@@ -391,9 +391,11 @@ public class OptimizerService(
 
     private static string SourceTag(string source) => source switch
     {
-        "llm"      => "LLM",
-        "llm-push" => "LLM★",
-        _          => "Heuristic",
+        "llm"         => "LLM",
+        "llm-push"    => "LLM★",
+        "claude"      => "Claude",
+        "claude-push" => "Claude★",
+        _             => "Heuristic",
     };
 
     // A capability gain is progress even when the speed-weighted composite drops: larger

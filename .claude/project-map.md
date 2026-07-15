@@ -39,7 +39,7 @@ README.md                    primary user-facing docs — usage, profiles, optim
 
 See `.claude/domains/` for details:
 
-- **Optimization loop** (`OptimizerService`, `RecommendationService`, `BenchmarkService`) — see [`.claude/domains/optimizer.md`](domains/optimizer.md)
+- **Optimization loop** (`OptimizerService`, `RecommendationService`, `BenchmarkService`, optional `CloudAdvisorService` — Claude CLI as recommender with local-LLM fallback) — see [`.claude/domains/optimizer.md`](domains/optimizer.md)
 - **llama-server process/API control** (`LlamaServerService`) — spawns/kills the server subprocess, calls its HTTP API (`/completion`, `/v1/chat/completions`, `/health`)
 - **Hardware detection** (`HardwareDetectionService`) — VRAM/RAM/CPU scan, Windows (`wmic`/`System.Management`/P-Invoke) and Linux (`/proc/*`) paths, plus `nvidia-smi`/`rocm-smi`
 - **Named profiles & sessions** (`ProfileLibraryService`, `SessionPersistenceService`) — persistence of saved configs and run history to `profiles/` and `sessions/`
@@ -90,6 +90,8 @@ No CI/CD pipeline files found in the repo.
 - IDE/editor folders
 
 ## Known Gotchas
+
+- GPU detection order in `HardwareDetectionService` is nvidia-smi → rocm-smi → (Windows) registry `HardwareInformation.qwMemorySize` → wmic. Never rely on `Win32_VideoController.AdapterRAM` for VRAM size: it's a uint32 and silently clamps every card above 4 GB to 4095 MB (this once fed "4GB GPU" into recommendation prompts on a 12 GB card). The registry path also estimates free VRAM from the `\GPU Adapter Memory(*)\Dedicated Usage` perf counter (single-adapter systems only).
 
 - `LlamaServerService` self-heals unsupported start settings (e.g. quantized KV cache without flash attention, or mmap failures) by retrying once with the setting reverted — `server.LastEffectiveSettings`/`LastStartAdjustmentNote` reflect what actually started, which may differ from what was requested. Downstream code (e.g. `OptimizerService`) must use the effective settings, not the requested ones.
 - `RecommendationService.ExplorationOrder` is the canonical list of parameters the optimizer walks; adding a new tunable parameter requires updating this array and the corresponding apply/switch logic.

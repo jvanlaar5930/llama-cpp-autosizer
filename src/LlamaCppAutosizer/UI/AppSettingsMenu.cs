@@ -7,7 +7,7 @@ namespace LlamaCppAutosizer.UI;
 // File-path-related app configuration: model folder, llama-server executable, where named
 // profiles / optimization history (sessions) are stored, and TurboQuant setup. Distinct from
 // "Edit llama.cpp Settings Manually", which edits per-run model/server tuning parameters.
-public class AppSettingsMenu(AppSettingsService appSettings, TurboQuantService turboQuant)
+public class AppSettingsMenu(AppSettingsService appSettings, TurboQuantService turboQuant, CloudAdvisorService cloudAdvisor)
 {
     /// <summary>
     /// Runs the Settings menu. <paramref name="manualSettings"/> is the caller's current
@@ -36,6 +36,7 @@ public class AppSettingsMenu(AppSettingsService appSettings, TurboQuantService t
                     "Profiles Output Directory",
                     "Sessions / Optimization History Directory",
                     "TurboQuant Options  (KV cache types, quantize a model)",
+                    "Cloud Advisor  (Claude CLI as the optimizer's recommender)",
                     "Reset directories to default shared location",
                 ]);
 
@@ -45,6 +46,7 @@ public class AppSettingsMenu(AppSettingsService appSettings, TurboQuantService t
             else if (choice.StartsWith("llama-server")) EditServerExecutable();
             else if (choice.StartsWith("Profiles")) EditProfilesDirectory();
             else if (choice.StartsWith("Sessions")) EditSessionsDirectory();
+            else if (choice.StartsWith("Cloud Advisor")) await EditCloudAdvisorAsync(ct);
             else if (choice.StartsWith("TurboQuant"))
             {
                 string? result = await TurboQuantSubmenuAsync(manualSettings, currentModelPath, ct);
@@ -76,6 +78,9 @@ public class AppSettingsMenu(AppSettingsService appSettings, TurboQuantService t
         table.AddRow("[grey]TurboQuant server[/]", string.IsNullOrWhiteSpace(s.TurboQuantServerExecutable)
             ? "[yellow]not set up — turbo4/turbo3/etc. cache types hidden until configured (TurboQuant Options)[/]"
             : $"[cyan]{Markup.Escape(s.TurboQuantServerExecutable)}[/] [grey](overrides llama-server path above)[/]");
+        table.AddRow("[grey]Cloud advisor[/]", string.IsNullOrWhiteSpace(s.CloudAdvisorCommand)
+            ? "[yellow]disabled — the local model recommends its own tuning steps[/]"
+            : $"[cyan]{Markup.Escape(s.CloudAdvisorCommand)}[/] [grey](model: {Markup.Escape(cloudAdvisor.ModelDisplay)})[/]");
 
         AnsiConsole.Write(table);
     }
@@ -135,6 +140,64 @@ public class AppSettingsMenu(AppSettingsService appSettings, TurboQuantService t
         appSettings.Save();
         AnsiConsole.MarkupLine($"[green]Sessions directory set:[/] {Markup.Escape(dir)}");
         AnsiConsole.MarkupLine("[grey]Existing sessions in the old location are not moved automatically.[/]");
+        Pause();
+    }
+
+    private async Task EditCloudAdvisorAsync(CancellationToken ct)
+    {
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(new Rule("[bold cyan]Cloud Advisor[/]").RuleStyle("cyan"));
+        AnsiConsole.MarkupLine("[grey]Uses the Claude Code CLI as the optimizer's recommender instead of the local model[/]");
+        AnsiConsole.MarkupLine("[grey]under test. A frontier model reasons over the run history far better than a heavily[/]");
+        AnsiConsole.MarkupLine("[grey]quantized local model advising on its own tuning. Falls back to the local LLM, then[/]");
+        AnsiConsole.MarkupLine("[grey]heuristics, whenever the CLI is unavailable. Uses your existing Claude login.[/]");
+        AnsiConsole.WriteLine();
+
+        string current = appSettings.Current.CloudAdvisorCommand ?? "";
+        string command = AnsiConsole.Prompt(
+            new TextPrompt<string>("Claude CLI command or full path (empty to disable):")
+                .DefaultValue(string.IsNullOrWhiteSpace(current) ? "claude" : current)
+                .AllowEmpty());
+
+        if (string.IsNullOrWhiteSpace(command))
+        {
+            appSettings.Current.CloudAdvisorCommand = null;
+            appSettings.Save();
+            AnsiConsole.MarkupLine("[grey]Cloud advisor disabled — recommendations come from the local model again.[/]");
+            Pause();
+            return;
+        }
+
+        string? modelChoice = MenuHelper.Select(
+            "Model for recommendations  [dim](Esc = CLI default)[/]",
+            [
+                "claude-opus-4-8  (recommended — strongest reasoning)",
+                "claude-sonnet-5  (faster, cheaper)",
+                "claude-haiku-4-5  (fastest)",
+                "CLI default model",
+                "Custom…",
+            ]);
+
+        string? model = modelChoice switch
+        {
+            null => null,
+            var c when c.StartsWith("CLI default") => null,
+            var c when c.StartsWith("Custom") =>
+                AnsiConsole.Prompt(new TextPrompt<string>("Model name/alias to pass via --model:").AllowEmpty()) is { Length: > 0 } m ? m : null,
+            var c => c.Split(' ')[0],
+        };
+
+        appSettings.Current.CloudAdvisorCommand = command.Trim();
+        appSettings.Current.CloudAdvisorModel = model;
+        appSettings.Save();
+
+        AnsiConsole.MarkupLine($"[green]Cloud advisor set:[/] {Markup.Escape(command)} [grey](model: {Markup.Escape(model ?? "CLI default")})[/]");
+        bool available = await AnsiConsole.Status()
+            .StartAsync("Checking CLI availability…", _ => cloudAdvisor.IsAvailableAsync(ct));
+        AnsiConsole.MarkupLine(available
+            ? "[green]CLI responded — cloud recommendations will be used on the next run.[/]"
+            : "[yellow]CLI did not respond to --version — the optimizer will silently fall back to the local model. " +
+              "Check that Claude Code is installed and the command/path is correct.[/]");
         Pause();
     }
 
