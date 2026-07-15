@@ -23,6 +23,23 @@ public class RecommendationService(
         "BatchSize", "UBatchSize", "ContextSize", "Threads", "Mlock",
     ];
 
+    // User-visible activity trail: which recommender was asked, what it determined, and
+    // every fallback along the Claude → local LLM → heuristic chain. The TUI wires this
+    // into the live log panel during optimization runs (ILogger output is suppressed below
+    // Warning there, so this is the only channel users actually see).
+    private Action<string>? _activityLog;
+    public void SetActivityLog(Action<string>? log)
+    {
+        _activityLog = log;
+        cloudAdvisor.SetActivityLog(log);
+    }
+
+    private void LogActivity(string message)
+    {
+        logger.LogInformation("{Message}", message);
+        _activityLog?.Invoke(message);
+    }
+
     /// <summary>
     /// Returns the next parameter change to try, using the LLM when possible
     /// and falling back to heuristic exploration.
@@ -44,24 +61,24 @@ public class RecommendationService(
                 string? content = await cloudAdvisor.CompleteAsync(prompt, ct);
                 var cloudRec = content is null ? null
                     : Retag(ParseLlmResponse(content, session.BestSettings!), "claude");
+                if (content is not null && cloudRec is null)
+                    LogActivity("Claude's response could not be parsed — falling back to local model");
                 if (cloudRec is not null && RecreatesTestedConfig(session, cloudRec))
                 {
-                    logger.LogInformation(
-                        "Cloud advisor suggested {Param} = {Val}, but that configuration was already benchmarked — falling back",
-                        cloudRec.Parameter, cloudRec.NewValue);
+                    LogActivity($"Claude suggested {cloudRec.Describe()}, but that configuration was " +
+                                "already benchmarked — falling back to local model");
                     cloudRec = null;
                 }
                 if (cloudRec is not null)
                 {
-                    logger.LogInformation("Cloud advisor recommended: {Param} = {Val} — {Reason}",
-                        cloudRec.Parameter, cloudRec.NewValue, cloudRec.Reasoning);
+                    LogActivity($"Claude recommends: {cloudRec.Describe()} — \"{cloudRec.Reasoning}\"");
                     return cloudRec;
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
             catch (Exception ex)
             {
-                logger.LogDebug("Cloud advisor recommendation failed, trying local LLM: {Msg}", ex.Message);
+                LogActivity($"Claude recommendation failed ({ex.Message}) — falling back to local model");
             }
         }
 
@@ -70,24 +87,25 @@ public class RecommendationService(
         {
             try
             {
+                LogActivity("Asking local model for the next recommendation…");
                 var llmRec = await GetLlmRecommendationAsync(session, profile, hardware, ct);
+                if (llmRec is null)
+                    LogActivity("Local model's response could not be parsed — falling back to heuristic");
                 if (llmRec is not null && RecreatesTestedConfig(session, llmRec))
                 {
-                    logger.LogInformation(
-                        "LLM suggested {Param} = {Val}, but that configuration was already benchmarked — falling back to heuristic",
-                        llmRec.Parameter, llmRec.NewValue);
+                    LogActivity($"Local model suggested {llmRec.Describe()}, but that configuration was " +
+                                "already benchmarked — falling back to heuristic");
                     llmRec = null;
                 }
                 if (llmRec is not null)
                 {
-                    logger.LogInformation("LLM recommended: {Param} = {Val} — {Reason}",
-                        llmRec.Parameter, llmRec.NewValue, llmRec.Reasoning);
+                    LogActivity($"Local model recommends: {llmRec.Describe()} — \"{llmRec.Reasoning}\"");
                     return llmRec;
                 }
             }
             catch (Exception ex)
             {
-                logger.LogDebug("LLM recommendation failed, using heuristic: {Msg}", ex.Message);
+                LogActivity($"Local model recommendation failed ({ex.Message}) — falling back to heuristic");
             }
         }
 
@@ -129,15 +147,19 @@ public class RecommendationService(
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
             catch (Exception ex)
             {
-                logger.LogDebug("Cloud advisor final-push failed, trying local LLM: {Msg}", ex.Message);
+                LogActivity($"Claude final-push call failed ({ex.Message}) — falling back to local model");
             }
         }
 
         if (!server.IsRunning)
+        {
+            LogActivity("Local server not running — using heuristic for the final push");
             return GetHeuristicRecommendation(session, profile, hardware);
+        }
 
         try
         {
+            LogActivity("Asking local model for a fresh angle (final push)…");
             var (response, _) = await server.CompleteAsync(new CompletionRequest
             {
                 Prompt = prompt,
@@ -150,7 +172,7 @@ public class RecommendationService(
         }
         catch (Exception ex)
         {
-            logger.LogDebug("Final-push LLM call failed: {Msg}", ex.Message);
+            LogActivity($"Local model final-push call failed ({ex.Message}) — falling back to heuristic");
             // Fall back to heuristic so we don't waste an iteration slot
             return GetHeuristicRecommendation(session, profile, hardware);
         }
@@ -166,24 +188,33 @@ public class RecommendationService(
         HardwareInfo hardware,
         string source)
     {
+        string who = source.StartsWith("claude") ? "Claude" : "Local model";
         content = content.Trim();
 
         // A "DONE" with no JSON is the recommender saying nothing more to try
         bool hasDone = content.Contains("DONE", StringComparison.OrdinalIgnoreCase);
         bool hasJson = content.Contains('{') && content.Contains('}');
-        if (hasDone && !hasJson) return null;
+        if (hasDone && !hasJson)
+        {
+            LogActivity($"{who} says DONE — no further improvements to suggest");
+            return null;
+        }
 
         var change = ParseLlmResponse(content, session.BestSettings!);
-        if (change is null) return null;
+        if (change is null)
+        {
+            LogActivity($"{who}'s final-push response could not be parsed — treating as DONE");
+            return null;
+        }
 
         if (RecreatesTestedConfig(session, change))
         {
-            logger.LogInformation(
-                "Final-push suggestion {Change} recreates an already-benchmarked configuration — falling back to heuristic",
-                change.Describe());
+            LogActivity($"{who}'s final-push suggestion {change.Describe()} recreates an " +
+                        "already-benchmarked configuration — falling back to heuristic");
             return GetHeuristicRecommendation(session, profile, hardware);
         }
 
+        LogActivity($"{who} final push: {change.Describe()} — \"{change.Reasoning}\"");
         // Tag it so the UI can show it as a "final push" iteration and its origin
         return Retag(change, source);
     }
@@ -602,11 +633,14 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
         var change = GetHeuristicCandidate(session, profile, hardware);
         if (change is not null && RecreatesTestedConfig(session, change))
         {
-            logger.LogInformation(
-                "Heuristic suggestion {Param} = {Val} recreates an already-benchmarked configuration — nothing new to try",
-                change.Parameter, change.NewValue);
+            LogActivity($"Heuristic suggestion {change.Describe()} recreates an already-benchmarked " +
+                        "configuration — nothing new to try");
             return null;
         }
+        if (change is not null)
+            LogActivity($"Heuristic selected: {change.Describe()} — \"{change.Reasoning}\"");
+        else
+            LogActivity("Heuristic pool exhausted — nothing left to try");
         return change;
     }
 

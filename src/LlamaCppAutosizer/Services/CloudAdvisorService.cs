@@ -26,6 +26,17 @@ public class CloudAdvisorService(
     private string? _probedCommand;
     private bool _probeSucceeded;
 
+    // User-visible activity trail (wired by RecommendationService.SetActivityLog into the
+    // TUI's live log panel) — call mechanics only; the recommendation decisions are logged
+    // by RecommendationService.
+    private Action<string>? _activityLog;
+    public void SetActivityLog(Action<string>? log) => _activityLog = log;
+    private void LogActivity(string message)
+    {
+        logger.LogInformation("{Message}", message);
+        _activityLog?.Invoke(message);
+    }
+
     public bool IsConfigured => !string.IsNullOrWhiteSpace(appSettings.Current.CloudAdvisorCommand);
 
     public string ModelDisplay => string.IsNullOrWhiteSpace(appSettings.Current.CloudAdvisorModel)
@@ -47,14 +58,13 @@ public class CloudAdvisorService(
         {
             var (exitCode, stdout, _) = await RunAsync(command, ["--version"], stdin: null, ProbeTimeout, ct);
             _probeSucceeded = exitCode == 0;
-            if (_probeSucceeded)
-                logger.LogInformation("Cloud advisor available: {Command} ({Version})", command, stdout.Trim());
-            else
-                logger.LogInformation("Cloud advisor probe failed (exit {Code}) for: {Command}", exitCode, command);
+            LogActivity(_probeSucceeded
+                ? $"Claude CLI available: {command} ({stdout.Trim()})"
+                : $"Claude CLI probe failed (exit {exitCode}) for '{command}' — falling back to the local model");
         }
         catch (Exception ex)
         {
-            logger.LogInformation("Cloud advisor not available ({Command}): {Msg}", command, ex.Message);
+            LogActivity($"Claude CLI not available ('{command}': {ex.Message}) — falling back to the local model");
         }
         return _probeSucceeded;
     }
@@ -75,15 +85,19 @@ public class CloudAdvisorService(
 
         try
         {
+            LogActivity($"Asking Claude ({ModelDisplay})…");
+            var sw = Stopwatch.StartNew();
             // Prompt goes via stdin — recommendation prompts carry the full optimization
             // history and can exceed command-line length limits.
             var (exitCode, stdout, stderr) = await RunAsync(command, args, prompt, CompletionTimeout, ct);
             if (exitCode != 0 || string.IsNullOrWhiteSpace(stdout))
             {
-                logger.LogInformation("Cloud advisor call failed (exit {Code}): {Err}",
-                    exitCode, stderr.Length > 200 ? stderr[..200] : stderr);
+                string err = stderr.Trim();
+                LogActivity($"Claude CLI call failed after {sw.Elapsed.TotalSeconds:F0}s " +
+                            $"(exit {exitCode}{(err.Length > 0 ? $": {(err.Length > 120 ? err[..120] : err)}" : "")})");
                 return null;
             }
+            LogActivity($"Claude replied in {sw.Elapsed.TotalSeconds:F0}s");
             return stdout.Trim();
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -92,7 +106,7 @@ public class CloudAdvisorService(
         }
         catch (Exception ex)
         {
-            logger.LogInformation("Cloud advisor call failed: {Msg}", ex.Message);
+            LogActivity($"Claude CLI call failed: {ex.Message}");
             return null;
         }
     }
