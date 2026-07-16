@@ -77,6 +77,24 @@ public class SessionPersistenceService(AppSettingsService appSettings, ILogger<S
     }
 
     /// <summary>
+    /// Loads earlier runs of the same model + profile (matched by model file name so a moved
+    /// GGUF still counts), newest first. Incomplete sessions — e.g. a run cut short by a
+    /// crash — are included: every iteration they managed to autosave is still a valid
+    /// measurement worth reusing.
+    /// </summary>
+    public async Task<List<OptimizationSession>> LoadPriorSessionsAsync(
+        string modelPath, ProfileType profile)
+    {
+        string modelName = Path.GetFileNameWithoutExtension(modelPath);
+        var sessions = await LoadAllAsync();
+        return sessions
+            .Where(s => s.Profile == profile
+                     && string.Equals(s.ModelName, modelName, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(s => s.StartedAt)
+            .ToList();
+    }
+
+    /// <summary>
     /// Exports a CSV comparing the best result from every session.
     /// </summary>
     public async Task ExportComparisonCsvAsync(

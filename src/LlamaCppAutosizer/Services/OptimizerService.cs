@@ -18,8 +18,12 @@ public class OptimizerService(
     RecommendationService recommender,
     HardwareDetectionService hardware,
     SessionPersistenceService persistence,
+    ProfileLibraryService profileLibrary,
     ILogger<OptimizerService> logger)
 {
+    /// <summary>Name of the auto-maintained "best known config" profile for a model+profile pair.</summary>
+    public static string AutoBestProfileName(string modelName, ProfileType profile)
+        => $"Auto-best: {modelName} ({profile})";
     /// <summary>
     /// Main optimization loop. Yields each completed iteration so the UI can
     /// display live progress. Call StopAsync() on the token to abort early.
@@ -43,6 +47,77 @@ public class OptimizerService(
         onPhase?.Invoke("Detecting hardware…");
         var hw = await hardware.DetectAsync();
         session.Hardware = hw;
+
+        // ── Live "auto-best" profile ─────────────────────────────────────────
+        // Whenever this run's best config changes, an auto-maintained named profile for the
+        // model is written to disk immediately — so a crash or freeze mid-run never loses
+        // the best result found so far, and the profile is selectable straight away as a
+        // baseline for the next run or for launching the model.
+        Guid? autoBestId = null;
+        string? autoBestSavedFp = null;
+        double? existingScoreGuard = null;   // a previous run's score we must beat before taking over
+        string? existingFp = null;
+        bool autoBestLookedUp = false;
+
+        async Task SaveAutoBestAsync(bool forceRefresh = false)
+        {
+            var bestIter = session.Best;
+            if (bestIter is null || bestIter.Result.GenerationRate <= 0) return;
+
+            string fp = bestIter.Settings.Fingerprint();
+            if (!forceRefresh && fp == autoBestSavedFp) return;
+
+            try
+            {
+                string name = AutoBestProfileName(session.ModelName, session.Profile);
+                if (!autoBestLookedUp)
+                {
+                    autoBestLookedUp = true;
+                    var existing = await profileLibrary.FindByNameAsync(name);
+                    if (existing is not null)
+                    {
+                        autoBestId = existing.Id;
+                        existingFp = existing.Settings.Fingerprint();
+                        existingScoreGuard = existing.BenchmarkScore;
+                    }
+                }
+
+                // Don't let a fresh run's weaker interim best clobber a better result from a
+                // previous run — hold off until this run matches the stored config or beats
+                // its score. (Once we've taken over, we follow this run's best freely.)
+                if (existingScoreGuard.HasValue
+                    && fp != existingFp
+                    && bestIter.Result.CompositeScore < existingScoreGuard.Value)
+                    return;
+                existingScoreGuard = null;
+
+                var autoProfile = new SavedProfile
+                {
+                    Id = autoBestId ?? Guid.NewGuid(),
+                    Name = name,
+                    ModelPath = session.ModelPath,
+                    Settings = bestIter.Settings.Clone(),
+                    OptimizationProfile = session.Profile,
+                    BenchmarkScore = bestIter.Result.CompositeScore,
+                    BenchmarkPpRate = bestIter.Result.PromptProcessingRate,
+                    BenchmarkTgRate = bestIter.Result.GenerationRate,
+                    BenchmarkTtftMs = bestIter.Result.TimeToFirstTokenMs,
+                    Notes = $"Auto-saved best configuration, updated live during optimization runs " +
+                            $"(last: {DateTime.Now:yyyy-MM-dd HH:mm}, iteration {bestIter.Number}). " +
+                            "Use it to launch the model or as the baseline for a new run.",
+                };
+                autoBestId = autoProfile.Id;
+                await profileLibrary.SaveAsync(autoProfile);
+                autoBestSavedFp = fp;
+                logger.LogDebug("Auto-best profile updated (iteration {N}, score {Score:F3})",
+                    bestIter.Number, bestIter.Result.CompositeScore);
+            }
+            catch (Exception ex)
+            {
+                // A profile-save hiccup must never abort the optimization run itself.
+                logger.LogWarning("Failed to update auto-best profile: {Msg}", ex.Message);
+            }
+        }
 
         try
         {
@@ -74,6 +149,7 @@ public class OptimizerService(
             };
             session.AddIteration(baseline);
             await persistence.SaveAsync(session);
+            await SaveAutoBestAsync();
 
             yield return baseline;
 
@@ -293,6 +369,7 @@ public class OptimizerService(
                 var prevAnchor = session.Best;
                 session.AddIteration(iteration);
                 await persistence.SaveAsync(session);
+                await SaveAutoBestAsync();
 
                 yield return iteration;
 
@@ -360,6 +437,9 @@ public class OptimizerService(
                     };
                     session.AddIteration(verification);
                     await persistence.SaveAsync(session);
+                    // MergeVerification changed the champion's metrics without changing its
+                    // fingerprint — refresh the auto-best profile's stored numbers.
+                    await SaveAutoBestAsync(forceRefresh: true);
                 }
                 catch (Exception ex)
                 {
@@ -379,6 +459,7 @@ public class OptimizerService(
                 : "Max iterations reached";
 
             await persistence.SaveAsync(session);
+            await SaveAutoBestAsync();
             await StopServerAsync();
 
             logger.LogInformation("Optimization complete. Best score: {Score:F3}", session.BestResult?.CompositeScore ?? 0);

@@ -358,6 +358,44 @@ public class MainMenu(
             if (_manualSettings.CacheTypeV is not null) initialSettings.CacheTypeV = _manualSettings.CacheTypeV;
         }
 
+        // ── Prior-run reuse ──────────────────────────────────────────────────────────────
+        // Previous sessions of this model + profile (including runs cut short by a crash —
+        // every iteration is autosaved as it completes) supply two things: the best settings
+        // found so far as an optional starting point, and the full set of already-benchmarked
+        // configurations so this run doesn't waste iterations re-testing them.
+        var priorSessions = await AnsiConsole.Status()
+            .StartAsync("Checking previous optimization runs…",
+                _ => persistence.LoadPriorSessionsAsync(_modelPath, _profile.Type));
+        List<OptimizationIteration> priorIterations = [];
+        if (priorSessions.Count > 0)
+        {
+            var priorBest = priorSessions
+                .Select(s => s.Best)
+                .Where(b => b is not null && b.Result.GenerationRate > 0)
+                .MaxBy(b => b!.Result.CompositeScore);
+
+            int testedConfigs = priorSessions.Sum(s => s.Iterations.Count);
+            AnsiConsole.MarkupLine(
+                $"[grey]Found {priorSessions.Count} previous run(s) for this model/profile — " +
+                $"{testedConfigs} configurations already benchmarked" +
+                (priorBest is null ? "[/]"
+                    : $" (best: score={priorBest.Result.CompositeScore:F3} TG={priorBest.Result.GenerationRate:F0}t/s)[/]"));
+
+            if (sourceProfile is null && priorBest is not null &&
+                AnsiConsole.Confirm("Start from the best settings found in previous runs?", true))
+            {
+                initialSettings = priorBest.Settings.Clone();
+                initialSettings.Label = "baseline";
+            }
+
+            if (AnsiConsole.Confirm("Skip configurations already benchmarked in previous runs?", true))
+                priorIterations = priorSessions
+                    .SelectMany(s => s.Iterations)
+                    .Where(i => !i.IsVerification)
+                    .ToList();
+            AnsiConsole.WriteLine();
+        }
+
         // Show and allow override
         AnsiConsole.Write(new Rule("[bold]Initial Settings[/]").RuleStyle("yellow"));
         SettingsEditor.RenderSettings(initialSettings, LlamaSettings.IsMoeModel(_modelPath));
@@ -419,6 +457,7 @@ public class MainMenu(
             Hardware = _hardware,   // optimizer will refresh this with a live DetectAsync
             TargetTgSpeed = targetTgSpeed,
             UserGuidance = string.IsNullOrWhiteSpace(userGuidance) ? null : userGuidance.Trim(),
+            PriorIterations = priorIterations,
         };
 
         AnsiConsole.Clear();

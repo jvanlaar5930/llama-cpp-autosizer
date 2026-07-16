@@ -54,6 +54,14 @@ public class OptimizationSession
 
     public List<OptimizationIteration> Iterations { get; init; } = [];
 
+    // Iterations imported from earlier optimization runs of the same model + profile
+    // (seeded at run setup, see MainMenu). They feed the duplicate guard and the
+    // recommenders' "already tried" knowledge so a new run never re-benchmarks a
+    // configuration a previous run already measured — but they are NOT part of this
+    // run's history: never serialized, never ranked by Best, never shown in the UI.
+    [System.Text.Json.Serialization.JsonIgnore]
+    public List<OptimizationIteration> PriorIterations { get; init; } = [];
+
     // Once generation speed reaches this, further tuning should spend headroom on quality
     // instead of chasing more raw speed. Shared with RecommendationService's heuristic tiers.
     // User-configurable per run (see MainMenu's optimization setup prompt); 30 t/s default.
@@ -129,12 +137,13 @@ public class OptimizationSession
 
     /// <summary>
     /// True if a configuration identical to <paramref name="candidate"/> has already been
-    /// benchmarked (or attempted — start failures count too) in this session. Used to stop
-    /// the optimizer from re-running settings it has already measured.
+    /// benchmarked (or attempted — start failures count too) in this session or in a seeded
+    /// previous run (<see cref="PriorIterations"/>). Used to stop the optimizer from
+    /// re-running settings it has already measured.
     /// </summary>
     public bool HasTestedConfiguration(LlamaSettings candidate)
     {
         var fp = candidate.Fingerprint();
-        return Iterations.Any(i => i.Settings.Fingerprint() == fp);
+        return Iterations.Concat(PriorIterations).Any(i => i.Settings.Fingerprint() == fp);
     }
 }

@@ -351,7 +351,7 @@ BEST SETTINGS SO FAR (score={{best.CompositeScore:F3}} | TG={{best.GenerationRat
 
 FULL OPTIMIZATION HISTORY:
 {{string.Join("\n", historyLines)}}
-
+{{PriorRunsPromptSection(session)}}
 GOAL: Target generation speed is {{session.TargetTgSpeed:F0}}t/s.
 - Below {{session.TargetTgSpeed:F0}}t/s: prioritize whatever raises TG speed most (GPU layers, flash-attn, mmap, KV cache quantization, batch size).
 - At or above {{session.TargetTgSpeed * QualityPhaseBufferFactor:F0}}t/s (target met with buffer): switch to QUALITY TUNING and spend the spare speed, in this order: (1) revert aggressive KV cache quantization (q4/q5-class → q8_0; q8_0 → f16 only with a lot of headroom) — low-bit KV quant is a common cause of repetition loops and degraded tool calls; (2) if quality/tool/agent-loop scores are below ~0.9, strengthen anti-loop samplers (DryMultiplier, RepeatPenalty); (3) for agentic profiles on thinking-capable models, enable ThinkingEnabled; (4) grow ContextSize (in +16,384 steps) for more capability.
@@ -378,6 +378,27 @@ Valid parameters and example values:
 Respond with ONLY this JSON (no markdown, no extra text before or after):
 {"parameter":"<name>","value":<value>,"reasoning":"<one hypothesis sentence: what you expect to happen and why — do not restate numbers from the history above>"}
 """;
+    }
+
+    // Compact "param=value" list of changes benchmarked in seeded previous runs of the same
+    // model + profile, so the LLM recommenders don't spend suggestions on configurations the
+    // duplicate guard will reject anyway. Values only — metric numbers from other runs aren't
+    // comparable to this one (different thermal state, background load, scoring baseline).
+    private static string PriorRunsPromptSection(OptimizationSession session)
+    {
+        if (session.PriorIterations.Count == 0) return "";
+
+        var pairs = session.PriorIterations
+            .Where(i => i.AppliedChange is not null)
+            .SelectMany(i => i.AppliedChange!.Chain())
+            .Select(c => $"{c.Parameter}={c.NewValue ?? "default"}")
+            .Distinct()
+            .ToList();
+        if (pairs.Count == 0) return "";
+
+        return "\nTESTED IN PREVIOUS RUNS of this model and profile (their exact configurations are " +
+               "seeded into the duplicate guard, so re-creating one will be rejected — prefer values " +
+               "not in this list): " + string.Join(", ", pairs) + "\n";
     }
 
     private static string BuildFinalPushPrompt(
@@ -430,7 +451,7 @@ BEST SETTINGS (score={{best.CompositeScore:F3}} vs baseline={{baselineScore:F3}}
 
 ALREADY TRIED (do NOT repeat any of these parameter=value pairs — recreating an already-benchmarked configuration will be rejected):
 {{string.Join("\n", triedSummary)}}
-
+{{PriorRunsPromptSection(session)}}
 TARGET: {{session.TargetTgSpeed:F0}}t/s generation speed. Current TG is {{best.GenerationRate:F0}}t/s.
 {{(best.GenerationRate >= session.TargetTgSpeed + LotsOfHeadroomAboveTarget
     ? "We're well above target — trade that spare speed for quality: revert quantized KV cache toward q8_0/f16, restore MoE active-expert count, enable thinking mode (agentic), or grow ContextSize — as long as TG stays at/above the target."
@@ -630,30 +651,51 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
         OptimizationProfile profile,
         HardwareInfo hardware)
     {
-        var change = GetHeuristicCandidate(session, profile, hardware);
-        if (change is not null && RecreatesTestedConfig(session, change))
+        // A candidate that recreates an already-benchmarked config (common once previous
+        // runs' results are seeded into the session) shouldn't end the pool — block that
+        // parameter and ask for the next idea. Bounded: each retry removes a parameter
+        // from consideration, so this can't loop.
+        var blocked = new HashSet<string>();
+        for (int attempt = 0; attempt < 8; attempt++)
         {
-            LogActivity($"Heuristic suggestion {change.Describe()} recreates an already-benchmarked " +
-                        "configuration — nothing new to try");
-            return null;
-        }
-        if (change is not null)
+            var change = GetHeuristicCandidate(session, profile, hardware, blocked);
+            if (change is null) break;
+
+            if (RecreatesTestedConfig(session, change))
+            {
+                LogActivity($"Heuristic suggestion {change.Describe()} recreates an already-benchmarked " +
+                            "configuration — skipping to the next idea");
+                foreach (var name in change.ParameterNames()) blocked.Add(name);
+                continue;
+            }
+
             LogActivity($"Heuristic selected: {change.Describe()} — \"{change.Reasoning}\"");
-        else
-            LogActivity("Heuristic pool exhausted — nothing left to try");
-        return change;
+            return change;
+        }
+
+        LogActivity("Heuristic pool exhausted — nothing left to try");
+        return null;
     }
 
     private ParameterChange? GetHeuristicCandidate(
         OptimizationSession session,
         OptimizationProfile profile,
-        HardwareInfo hardware)
+        HardwareInfo hardware,
+        IReadOnlySet<string>? blockedParams = null)
     {
-        // Parameters tried so far (by name — for single-shot explorations)
+        // Parameters tried so far (by name — for single-shot explorations). Deliberately
+        // this session only: seeded prior-run knowledge is applied at the exact
+        // parameter=value / full-fingerprint level (AlreadyTriedValue, the duplicate guard),
+        // not by name — a previous run exploring GpuLayers from a different baseline says
+        // nothing about the values this run would pick.
         var tried = session.Iterations
             .Where(i => i.AppliedChange is not null)
             .SelectMany(i => i.AppliedChange!.ParameterNames())
             .ToHashSet();
+        if (blockedParams is not null) tried.UnionWith(blockedParams);
+        // Branches gated on parameter *values* (AlreadyTriedValue) rather than names must
+        // check this too, or a blocked candidate would just be re-proposed on retry.
+        bool Blocked(string param) => blockedParams?.Contains(param) ?? false;
 
         var best = session.BestResult!;
         var bestSettings = session.BestSettings!;
@@ -701,7 +743,7 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
                      { ("CacheTypeK", bestSettings.CacheTypeK), ("CacheTypeV", bestSettings.CacheTypeV) })
             {
                 string? revert = KvQuantRevertTarget(current, lotsOfSpeedHeadroom);
-                if (revert is not null && !AlreadyTriedValue(session, param, revert))
+                if (revert is not null && !Blocked(param) && !AlreadyTriedValue(session, param, revert))
                     return Change(param, current ?? "f16", revert,
                         $"TG={best.GenerationRate:F0}t/s clears the {targetTgSpeed:F0}t/s target — " +
                         $"reverting {param} {current} → {revert} to protect output quality");
@@ -715,11 +757,11 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
                 || (profile.Type == ProfileType.Agentic && best.AgentLoopScore < 0.9);
             if (loopSignal)
             {
-                if ((bestSettings.DryMultiplier ?? 0f) < 1.05f && !AlreadyTriedValue(session, "DryMultiplier", 1.05f))
+                if ((bestSettings.DryMultiplier ?? 0f) < 1.05f && !Blocked("DryMultiplier") && !AlreadyTriedValue(session, "DryMultiplier", 1.05f))
                     return Change("DryMultiplier", bestSettings.DryMultiplier?.ToString() ?? "server default", 1.05f,
                         "Quality/agent-loop score shows loop symptoms — strengthening the DRY sampler");
 
-                if ((bestSettings.RepeatPenalty ?? 1.0f) < 1.15f && !AlreadyTriedValue(session, "RepeatPenalty", 1.15f))
+                if ((bestSettings.RepeatPenalty ?? 1.0f) < 1.15f && !Blocked("RepeatPenalty") && !AlreadyTriedValue(session, "RepeatPenalty", 1.15f))
                     return Change("RepeatPenalty", bestSettings.RepeatPenalty?.ToString() ?? "server default", 1.15f,
                         "Loop symptoms persist — raising repeat-penalty a step");
             }
@@ -729,13 +771,14 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
             if (profile.Type == ProfileType.Agentic
                 && LlamaSettings.IsThinkingModel(session.ModelPath)
                 && bestSettings.ThinkingEnabled != true
+                && !Blocked("ThinkingEnabled")
                 && !AlreadyTriedValue(session, "ThinkingEnabled", true))
                 return Change("ThinkingEnabled", bestSettings.ThinkingEnabled ?? false, true,
                     $"TG={best.GenerationRate:F0}t/s clears the {targetTgSpeed:F0}t/s target — " +
                     "enabling thinking mode to improve tool-call correctness");
 
             // 4. A lot of headroom → actively give some back for quality (more MoE experts).
-            if (lotsOfSpeedHeadroom && isMoe && bestSettings.MoeExpertUsed.HasValue)
+            if (lotsOfSpeedHeadroom && isMoe && bestSettings.MoeExpertUsed.HasValue && !Blocked("MoeExpertUsed"))
             {
                 bool alreadyRestoredDefault = AppliedChanges(session).Any(c =>
                     c.Parameter == "MoeExpertUsed" && c.NewValue is null);
@@ -746,7 +789,7 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
             }
 
             // 5. Grow context — free capability that doesn't cost the speed already banked.
-            int? qualityCtx = NextContextStep(session, bestSettings);
+            int? qualityCtx = Blocked("ContextSize") ? null : NextContextStep(session, bestSettings);
             if (qualityCtx is not null)
                 return Change("ContextSize", bestSettings.ContextSize, qualityCtx.Value,
                     $"TG={best.GenerationRate:F0}t/s is at/above the {targetTgSpeed:F0}t/s target — " +
@@ -802,7 +845,7 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
                 "q8_0 KV cache halves KV cache VRAM with minimal quality loss");
 
         // MoE: escalate to fewer experts still if the first reduction helped
-        if (isMoe && tried.Contains("MoeExpertUsed") && bestSettings.MoeExpertUsed is > 2)
+        if (isMoe && tried.Contains("MoeExpertUsed") && !Blocked("MoeExpertUsed") && bestSettings.MoeExpertUsed is > 2)
         {
             int nextExperts = Math.Max(1, bestSettings.MoeExpertUsed.Value - 2);
             bool alreadyTried = AppliedChanges(session).Any(c =>
@@ -827,7 +870,7 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
 
         // Progressive context expansion — both profiles. +16,384 tokens per step, only while
         // score has been improving, and only if this specific target value hasn't been tried.
-        if (scoreImproved)
+        if (scoreImproved && !Blocked("ContextSize"))
         {
             int? nextCtx = NextContextStep(session, bestSettings);
             if (nextCtx is not null)
@@ -836,7 +879,8 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
         }
 
         // Escalate KV quant if the first round helped
-        if (tried.Contains("CacheTypeK") && bestSettings.CacheTypeK == "q8_0")
+        if (tried.Contains("CacheTypeK") && !Blocked("CacheTypeK") && bestSettings.CacheTypeK == "q8_0"
+            && !AlreadyTriedValue(session, "CacheTypeK", "q4_0"))
             return Change("CacheTypeK", "q8_0", "q4_0",
                 "q4_0 further reduces KV cache VRAM at some quality cost — worth testing");
 
@@ -851,6 +895,7 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
 
         // If context hasn't been expanded yet (score hasn't improved enough to trigger
         // the gate above) but we've run out of other ideas, try it anyway as a last resort.
+        if (!Blocked("ContextSize"))
         {
             int? nextCtx = NextContextStep(session, bestSettings);
             if (nextCtx is not null)
@@ -888,15 +933,17 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
     };
 
     // True if this exact parameter=value pair has been applied at some point this session
-    // (compared as strings — values arrive as int/float/bool/string depending on the source).
+    // or in a seeded previous run (compared as strings — values arrive as
+    // int/float/bool/string depending on the source).
     private static bool AlreadyTriedValue(OptimizationSession session, string parameter, object? value) =>
         AppliedChanges(session).Any(c =>
             c.Parameter == parameter &&
             string.Equals(c.NewValue?.ToString(), value?.ToString(), StringComparison.OrdinalIgnoreCase));
 
-    // Every individual parameter change applied this session, with combined changes flattened.
+    // Every individual parameter change applied this session or in a seeded previous run
+    // of the same model + profile, with combined changes flattened.
     private static IEnumerable<ParameterChange> AppliedChanges(OptimizationSession session) =>
-        session.Iterations
+        session.Iterations.Concat(session.PriorIterations)
             .Where(i => i.AppliedChange is not null)
             .SelectMany(i => i.AppliedChange!.Chain());
 
