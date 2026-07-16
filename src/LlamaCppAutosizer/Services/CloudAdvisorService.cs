@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 
 namespace LlamaCppAutosizer.Services;
@@ -30,12 +31,25 @@ public class CloudAdvisorService(
     // TUI's live log panel) — call mechanics only; the recommendation decisions are logged
     // by RecommendationService.
     private Action<string>? _activityLog;
-    public void SetActivityLog(Action<string>? log) => _activityLog = log;
+    public void SetActivityLog(Action<string>? log)
+    {
+        _activityLog = log;
+        // A non-null handler marks the start of an optimization run — reset the running
+        // usage totals so the per-run summary in each log line starts from zero.
+        if (log is not null) { _runCalls = 0; _runInputTokens = 0; _runOutputTokens = 0; _runCostUsd = 0; }
+    }
     private void LogActivity(string message)
     {
         logger.LogInformation("{Message}", message);
         _activityLog?.Invoke(message);
     }
+
+    // Cumulative usage across the current optimization run, shown after every call so
+    // users always see what the cloud advisor is consuming.
+    private int _runCalls;
+    private long _runInputTokens;
+    private long _runOutputTokens;
+    private double _runCostUsd;
 
     public bool IsConfigured => !string.IsNullOrWhiteSpace(appSettings.Current.CloudAdvisorCommand);
 
@@ -79,7 +93,8 @@ public class CloudAdvisorService(
         if (!await IsAvailableAsync(ct)) return null;
 
         string command = appSettings.Current.CloudAdvisorCommand!.Trim();
-        var args = new List<string> { "-p" };
+        // JSON output envelope carries the answer plus token usage and cost per call.
+        var args = new List<string> { "-p", "--output-format", "json" };
         string? model = appSettings.Current.CloudAdvisorModel;
         if (!string.IsNullOrWhiteSpace(model)) { args.Add("--model"); args.Add(model.Trim()); }
 
@@ -97,8 +112,34 @@ public class CloudAdvisorService(
                             $"(exit {exitCode}{(err.Length > 0 ? $": {(err.Length > 120 ? err[..120] : err)}" : "")})");
                 return null;
             }
-            LogActivity($"Claude replied in {sw.Elapsed.TotalSeconds:F0}s");
-            return stdout.Trim();
+
+            var parsed = TryParseCliJson(stdout);
+            if (parsed is null)
+            {
+                // Older CLI or unexpected shape — treat stdout as the plain answer.
+                LogActivity($"Claude replied in {sw.Elapsed.TotalSeconds:F0}s (no usage info in response)");
+                return stdout.Trim();
+            }
+            if (parsed.IsError)
+            {
+                LogActivity($"Claude CLI reported an error after {sw.Elapsed.TotalSeconds:F0}s: " +
+                            $"{(parsed.Text.Length > 120 ? parsed.Text[..120] : parsed.Text)}");
+                return null;
+            }
+
+            _runCalls++;
+            _runInputTokens += parsed.InputTokens;
+            _runOutputTokens += parsed.OutputTokens;
+            _runCostUsd += parsed.CostUsd;
+
+            string cached = parsed.CacheReadTokens > 0 ? $" ({parsed.CacheReadTokens:N0} cached)" : "";
+            string cost = parsed.CostUsd > 0 ? $", ${parsed.CostUsd:F4}" : "";
+            string runCost = _runCostUsd > 0 ? $", ${_runCostUsd:F4}" : "";
+            LogActivity($"Claude replied in {sw.Elapsed.TotalSeconds:F0}s — " +
+                        $"tokens in {parsed.InputTokens:N0}{cached} / out {parsed.OutputTokens:N0}{cost}  " +
+                        $"[run total: {_runCalls} call{(_runCalls == 1 ? "" : "s")}, " +
+                        $"{_runInputTokens:N0} in / {_runOutputTokens:N0} out{runCost}]");
+            return parsed.Text.Trim();
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -109,6 +150,44 @@ public class CloudAdvisorService(
             LogActivity($"Claude CLI call failed: {ex.Message}");
             return null;
         }
+    }
+
+    // Parsed `claude -p --output-format json` result envelope. InputTokens includes cache
+    // reads/writes so the number reflects what the call actually consumed context-wise.
+    private sealed record CliResult(
+        string Text, long InputTokens, long CacheReadTokens, long OutputTokens, double CostUsd, bool IsError);
+
+    private static CliResult? TryParseCliJson(string stdout)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(stdout);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return null;
+            if (root.TryGetProperty("result", out var r) is false || r.ValueKind != JsonValueKind.String)
+                return null;
+
+            bool isError = root.TryGetProperty("is_error", out var e) && e.ValueKind == JsonValueKind.True;
+            double cost = root.TryGetProperty("total_cost_usd", out var c) && c.ValueKind == JsonValueKind.Number
+                ? c.GetDouble() : 0;
+
+            long inTok = 0, outTok = 0, cacheRead = 0;
+            if (root.TryGetProperty("usage", out var u) && u.ValueKind == JsonValueKind.Object)
+            {
+                cacheRead = GetLong(u, "cache_read_input_tokens");
+                inTok = GetLong(u, "input_tokens") + cacheRead + GetLong(u, "cache_creation_input_tokens");
+                outTok = GetLong(u, "output_tokens");
+            }
+
+            return new CliResult(r.GetString() ?? "", inTok, cacheRead, outTok, cost, isError);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+
+        static long GetLong(JsonElement obj, string name) =>
+            obj.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt64() : 0;
     }
 
     private static async Task<(int exitCode, string stdout, string stderr)> RunAsync(
