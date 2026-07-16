@@ -175,50 +175,72 @@ public class OptimizerService(
                 hw = await hardware.DetectAsync();
 
                 // ── Pick the next change to try ───────────────────────────────
+                // A bug anywhere in the recommendation chain must not take down the run —
+                // the session already holds real measurements worth keeping, so end
+                // gracefully (best result, verification, and persistence all still happen).
                 ParameterChange? change;
-
-                if (consecutiveNonImprovements >= maxConsecutiveNonImprovements)
+                try
                 {
-                    // Patience exhausted: present best to LLM and ask for a new angle
-                    consecutiveNonImprovements = 0;
-                    logger.LogInformation("{N} consecutive non-improvements — asking LLM for final push",
-                        maxConsecutiveNonImprovements);
-
-                    onPhase?.Invoke($"Iteration {iter}/{options.MaxIterations} — asking LLM for a fresh angle…");
-                    change = await recommender.GetFinalPushAsync(session, profile, hw, ct);
-                    if (change is null)
-                    {
-                        // LLM said DONE — but a single DONE against a no-improvement history
-                        // shouldn't end the run while the heuristic pool still has untried
-                        // moves (e.g. the quality-phase steps). Only stop when both agree.
-                        change = recommender.GetHeuristicRecommendation(session, profile, hw);
-                        if (change is null)
-                        {
-                            session.CompletionReason = "LLM confirmed no further improvements possible";
-                            break;
-                        }
-                        logger.LogInformation(
-                            "LLM said DONE but heuristic still has an untried move — continuing with {Change}",
-                            change.Describe());
-                    }
+                    change = await PickNextChangeAsync();
                 }
-                else
+                catch (OperationCanceledException) { break; }
+                catch (Exception ex)
                 {
-                    onPhase?.Invoke($"Iteration {iter}/{options.MaxIterations} — asking for next recommendation…");
-                    change = await recommender.GetNextRecommendationAsync(session, profile, hw, ct);
-                    if (change is null)
+                    logger.LogWarning("Recommendation engine failed: {Msg}", ex.Message);
+                    session.CompletionReason = $"Stopped early — recommendation engine failed: {ex.Message}";
+                    break;
+                }
+                if (change is null) break;
+
+                async Task<ParameterChange?> PickNextChangeAsync()
+                {
+                    ParameterChange? picked;
+
+                    if (consecutiveNonImprovements >= maxConsecutiveNonImprovements)
                     {
-                        // Normal pool exhausted — try the final push before giving up
-                        logger.LogInformation("Recommendation pool empty — trying final-push LLM prompt");
-                        onPhase?.Invoke($"Iteration {iter}/{options.MaxIterations} — asking LLM for a fresh angle…");
-                        change = await recommender.GetFinalPushAsync(session, profile, hw, ct);
-                        if (change is null)
-                        {
-                            session.CompletionReason = "All parameters explored — LLM confirmed nothing further to try";
-                            break;
-                        }
+                        // Patience exhausted: present best to LLM and ask for a new angle
                         consecutiveNonImprovements = 0;
+                        logger.LogInformation("{N} consecutive non-improvements — asking LLM for final push",
+                            maxConsecutiveNonImprovements);
+
+                        onPhase?.Invoke($"Iteration {iter}/{options.MaxIterations} — asking LLM for a fresh angle…");
+                        picked = await recommender.GetFinalPushAsync(session, profile, hw, ct);
+                        if (picked is null)
+                        {
+                            // LLM said DONE — but a single DONE against a no-improvement history
+                            // shouldn't end the run while the heuristic pool still has untried
+                            // moves (e.g. the quality-phase steps). Only stop when both agree.
+                            picked = recommender.GetHeuristicRecommendation(session, profile, hw);
+                            if (picked is null)
+                            {
+                                session.CompletionReason = "LLM confirmed no further improvements possible";
+                                return null;
+                            }
+                            logger.LogInformation(
+                                "LLM said DONE but heuristic still has an untried move — continuing with {Change}",
+                                picked.Describe());
+                        }
                     }
+                    else
+                    {
+                        onPhase?.Invoke($"Iteration {iter}/{options.MaxIterations} — asking for next recommendation…");
+                        picked = await recommender.GetNextRecommendationAsync(session, profile, hw, ct);
+                        if (picked is null)
+                        {
+                            // Normal pool exhausted — try the final push before giving up
+                            logger.LogInformation("Recommendation pool empty — trying final-push LLM prompt");
+                            onPhase?.Invoke($"Iteration {iter}/{options.MaxIterations} — asking LLM for a fresh angle…");
+                            picked = await recommender.GetFinalPushAsync(session, profile, hw, ct);
+                            if (picked is null)
+                            {
+                                session.CompletionReason = "All parameters explored — LLM confirmed nothing further to try";
+                                return null;
+                            }
+                            consecutiveNonImprovements = 0;
+                        }
+                    }
+
+                    return picked;
                 }
 
                 var nextSettings = RecommendationService.Apply(session.BestSettings!, change);

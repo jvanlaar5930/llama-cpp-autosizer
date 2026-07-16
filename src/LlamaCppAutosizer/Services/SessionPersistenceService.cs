@@ -14,8 +14,36 @@ public class SessionPersistenceService(AppSettingsService appSettings, ILogger<S
         WriteIndented = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        Converters = { new JsonStringEnumConverter() },
+        Converters = { new JsonStringEnumConverter(), new ObjectPrimitiveConverter() },
     };
+
+    // ParameterChange.OldValue/NewValue are typed `object?`. Without this, deserialized
+    // sessions carry JsonElement there instead of the int/bool/string a live run produces,
+    // and consumers like Convert.ToInt32 crash on it (JsonElement is not IConvertible) —
+    // seen when prior-run iterations are seeded into a new session's recommendation logic.
+    private sealed class ObjectPrimitiveConverter : JsonConverter<object?>
+    {
+        public override object? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+            => reader.TokenType switch
+            {
+                JsonTokenType.True => true,
+                JsonTokenType.False => false,
+                JsonTokenType.String => reader.GetString(),
+                // Box each branch explicitly — a bare ternary would promote every branch to
+                // double (the common numeric type) before boxing, turning ints into doubles.
+                JsonTokenType.Number => reader.TryGetInt32(out int i) ? (object)i
+                                      : reader.TryGetInt64(out long l) ? (object)l
+                                      : reader.GetDouble(),
+                // Arrays/objects don't occur in these fields today; keep them as JsonElement.
+                _ => JsonSerializer.Deserialize<JsonElement>(ref reader, options),
+            };
+
+        public override void Write(Utf8JsonWriter writer, object? value, JsonSerializerOptions options)
+        {
+            if (value is null) writer.WriteNullValue();
+            else JsonSerializer.Serialize(writer, value, value.GetType(), options);
+        }
+    }
 
     public async Task SaveAsync(OptimizationSession session)
     {
