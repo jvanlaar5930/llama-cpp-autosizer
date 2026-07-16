@@ -16,6 +16,7 @@ namespace LlamaCppAutosizer.Services;
 /// </summary>
 public class CloudAdvisorService(
     AppSettingsService appSettings,
+    IHttpClientFactory httpClientFactory,
     ILogger<CloudAdvisorService> logger)
 {
     // A recommendation is a small JSON object; frontier models answer well within this.
@@ -36,7 +37,11 @@ public class CloudAdvisorService(
         _activityLog = log;
         // A non-null handler marks the start of an optimization run — reset the running
         // usage totals so the per-run summary in each log line starts from zero.
-        if (log is not null) { _runCalls = 0; _runInputTokens = 0; _runOutputTokens = 0; _runCostUsd = 0; }
+        if (log is not null)
+        {
+            _runCalls = 0; _runInputTokens = 0; _runOutputTokens = 0; _runCostUsd = 0;
+            _planUsageUnavailable = false;
+        }
     }
     private void LogActivity(string message)
     {
@@ -50,6 +55,11 @@ public class CloudAdvisorService(
     private long _runInputTokens;
     private long _runOutputTokens;
     private double _runCostUsd;
+
+    // Plan-limit usage (the "/usage" numbers): sticky-disabled after the first failure so
+    // a missing credential file or a changed endpoint logs nothing per-iteration. Reset at
+    // run start alongside the run totals.
+    private bool _planUsageUnavailable;
 
     public bool IsConfigured => !string.IsNullOrWhiteSpace(appSettings.Current.CloudAdvisorCommand);
 
@@ -139,6 +149,11 @@ public class CloudAdvisorService(
                         $"tokens in {parsed.InputTokens:N0}{cached} / out {parsed.OutputTokens:N0}{cost}  " +
                         $"[run total: {_runCalls} call{(_runCalls == 1 ? "" : "s")}, " +
                         $"{_runInputTokens:N0} in / {_runOutputTokens:N0} out{runCost}]");
+
+            string? planUsage = await TryGetPlanUsageAsync(ct);
+            if (planUsage is not null)
+                LogActivity($"Plan usage: {planUsage}");
+
             return parsed.Text.Trim();
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -150,6 +165,98 @@ public class CloudAdvisorService(
             LogActivity($"Claude CLI call failed: {ex.Message}");
             return null;
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Plan-limit usage (the numbers Claude Code's /usage screen shows)
+    // -------------------------------------------------------------------------
+    // The CLI exposes these only in its interactive TUI, so we query the same OAuth
+    // endpoint it uses, authenticated with the token Claude Code already stores locally.
+    // The token is read-only here and never logged or persisted anywhere else. Undocumented
+    // endpoint: parsing is defensive, and any failure sticky-disables the feature for the
+    // rest of the run so nothing breaks if the shape changes.
+
+    private static readonly (string Key, string Label)[] UsageWindows =
+    [
+        ("five_hour", "session"),
+        ("seven_day", "weekly"),
+        ("seven_day_opus", "weekly Opus"),
+    ];
+
+    private async Task<string?> TryGetPlanUsageAsync(CancellationToken ct)
+    {
+        if (_planUsageUnavailable) return null;
+        try
+        {
+            string credPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".claude", ".credentials.json");
+            if (!File.Exists(credPath)) { _planUsageUnavailable = true; return null; }
+
+            using var credDoc = JsonDocument.Parse(await File.ReadAllTextAsync(credPath, ct));
+            if (!credDoc.RootElement.TryGetProperty("claudeAiOauth", out var oauth) ||
+                oauth.ValueKind != JsonValueKind.Object ||
+                !oauth.TryGetProperty("accessToken", out var tokenEl) ||
+                tokenEl.GetString() is not { Length: > 0 } token)
+            {
+                _planUsageUnavailable = true;
+                return null;
+            }
+
+            using var http = httpClientFactory.CreateClient();
+            http.Timeout = TimeSpan.FromSeconds(15);
+            using var request = new HttpRequestMessage(HttpMethod.Get, "https://api.anthropic.com/api/oauth/usage");
+            request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
+            request.Headers.TryAddWithoutValidation("anthropic-beta", "oauth-2025-04-20");
+            using var response = await http.SendAsync(request, ct);
+            if (!response.IsSuccessStatusCode)
+            {
+                logger.LogDebug("Plan usage endpoint returned {Status}", response.StatusCode);
+                _planUsageUnavailable = true;
+                return null;
+            }
+
+            using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
+            var parts = new List<string>();
+            foreach (var (key, label) in UsageWindows)
+            {
+                if (doc.RootElement.ValueKind != JsonValueKind.Object ||
+                    !doc.RootElement.TryGetProperty(key, out var window) ||
+                    window.ValueKind != JsonValueKind.Object ||
+                    !window.TryGetProperty("utilization", out var util) ||
+                    util.ValueKind != JsonValueKind.Number)
+                    continue;
+
+                double pct = util.GetDouble();
+                if (key == "seven_day_opus" && pct <= 0) continue;   // skip a quiet Opus window
+
+                string reset = "";
+                if (window.TryGetProperty("resets_at", out var resetsAt) &&
+                    resetsAt.ValueKind == JsonValueKind.String &&
+                    DateTimeOffset.TryParse(resetsAt.GetString(), out var at))
+                    reset = $" (resets in {FormatDelta(at - DateTimeOffset.UtcNow)})";
+
+                parts.Add($"{label} {pct:F0}% used{reset}");
+            }
+
+            if (parts.Count == 0) { _planUsageUnavailable = true; return null; }
+            return string.Join(" / ", parts);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            logger.LogDebug("Plan usage lookup failed: {Msg}", ex.Message);
+            _planUsageUnavailable = true;
+            return null;
+        }
+    }
+
+    private static string FormatDelta(TimeSpan delta)
+    {
+        if (delta <= TimeSpan.Zero) return "now";
+        if (delta.TotalDays >= 1) return $"{(int)delta.TotalDays}d {delta.Hours}h";
+        if (delta.TotalHours >= 1) return $"{(int)delta.TotalHours}h {delta.Minutes}m";
+        return $"{Math.Max(1, delta.Minutes)}m";
     }
 
     // Parsed `claude -p --output-format json` result envelope. InputTokens includes cache
