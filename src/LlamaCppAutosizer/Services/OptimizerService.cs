@@ -24,6 +24,13 @@ public class OptimizerService(
     /// <summary>Name of the auto-maintained "best known config" profile for a model+profile pair.</summary>
     public static string AutoBestProfileName(string modelName, ProfileType profile)
         => $"Auto-best: {modelName} ({profile})";
+
+    // Below this fraction of the target TG speed the config counts as catastrophically slow
+    // (e.g. 1 t/s against a 30 t/s target) — normal incremental tuning is diverted into
+    // drastic rescue recommendations, capped at MaxRescueAttempts before the run concludes
+    // the hardware can't handle the model.
+    private const double RescueThresholdFraction = 0.25;
+    private const int MaxRescueAttempts = 2;
     /// <summary>
     /// Main optimization loop. Yields each completed iteration so the UI can
     /// display live progress. Call StopAsync() on the token to abort early.
@@ -165,6 +172,7 @@ public class OptimizerService(
             int consecutiveStartFailures = 0;
             int maxConsecutiveNonImprovements = Math.Max(1, options.ConvergencePatience);
             const int MaxConsecutiveStartFailures = 5;
+            int rescueAttempts = 0;
 
             for (int iter = 1; iter <= options.MaxIterations && !ct.IsCancellationRequested; iter++)
             {
@@ -174,6 +182,33 @@ public class OptimizerService(
                 onPhase?.Invoke($"Iteration {iter}/{options.MaxIterations} — refreshing hardware info…");
                 hw = await hardware.DetectAsync();
 
+                // ── Hardware-insufficiency rescue ─────────────────────────────
+                // When generation speed is catastrophically below target (e.g. 1 t/s against
+                // a 30 t/s goal), incremental tuning is pointless — the model likely doesn't
+                // fit its compute budget. Divert to drastic rescue recommendations; after
+                // MaxRescueAttempts benchmarked attempts with no escape, tell the user the
+                // hardware isn't enough for this model rather than burning more iterations.
+                // Judged on the fastest speed measured by ANY iteration, not the current
+                // anchor's — a rescue config that fixed the speed but lost the composite
+                // ranking (quality trade-off) still proves the hardware can cope.
+                double bestTg = session.Iterations
+                    .Where(i => !i.IsVerification)
+                    .Select(i => i.Result.GenerationRate)
+                    .DefaultIfEmpty(0)
+                    .Max();
+                bool catastrophicallySlow = bestTg > 0
+                    && bestTg < session.TargetTgSpeed * RescueThresholdFraction;
+
+                if (catastrophicallySlow && rescueAttempts >= MaxRescueAttempts)
+                {
+                    session.CompletionReason =
+                        $"Hardware insufficient for this model: fastest measured generation speed is {bestTg:F1} t/s " +
+                        $"against a {session.TargetTgSpeed:F0} t/s target even after {MaxRescueAttempts} " +
+                        "drastic rescue attempts. Try a smaller model, a lower-bit quant, or a lower target.";
+                    logger.LogWarning("{Reason}", session.CompletionReason);
+                    break;
+                }
+
                 // ── Pick the next change to try ───────────────────────────────
                 // A bug anywhere in the recommendation chain must not take down the run —
                 // the session already holds real measurements worth keeping, so end
@@ -181,7 +216,18 @@ public class OptimizerService(
                 ParameterChange? change;
                 try
                 {
-                    change = await PickNextChangeAsync();
+                    if (catastrophicallySlow)
+                    {
+                        rescueAttempts++;
+                        onPhase?.Invoke($"Iteration {iter}/{options.MaxIterations} — TG far below target, " +
+                                        $"asking for drastic speed changes (rescue {rescueAttempts}/{MaxRescueAttempts})…");
+                        change = await recommender.GetRescueAsync(
+                            session, profile, hw, rescueAttempts, MaxRescueAttempts, ct);
+                    }
+                    else
+                    {
+                        change = await PickNextChangeAsync();
+                    }
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex)
@@ -190,7 +236,16 @@ public class OptimizerService(
                     session.CompletionReason = $"Stopped early — recommendation engine failed: {ex.Message}";
                     break;
                 }
-                if (change is null) break;
+                if (change is null)
+                {
+                    // PickNextChangeAsync sets its own reason; a null rescue means every
+                    // drastic lever has been pulled (or the recommenders agree it's hopeless).
+                    session.CompletionReason ??=
+                        $"Hardware insufficient for this model: generation speed is {bestTg:F1} t/s " +
+                        $"against a {session.TargetTgSpeed:F0} t/s target and no drastic speed changes " +
+                        "are left to try. Try a smaller model, a lower-bit quant, or a lower target.";
+                    break;
+                }
 
                 async Task<ParameterChange?> PickNextChangeAsync()
                 {
@@ -494,11 +549,14 @@ public class OptimizerService(
 
     private static string SourceTag(string source) => source switch
     {
-        "llm"         => "LLM",
-        "llm-push"    => "LLM★",
-        "claude"      => "Claude",
-        "claude-push" => "Claude★",
-        _             => "Heuristic",
+        "llm"              => "LLM",
+        "llm-push"         => "LLM★",
+        "llm-rescue"       => "LLM⚑",
+        "claude"           => "Claude",
+        "claude-push"      => "Claude★",
+        "claude-rescue"    => "Claude⚑",
+        "heuristic-rescue" => "Rescue",
+        _                  => "Heuristic",
     };
 
     // A capability gain is progress even when the speed-weighted composite drops: larger

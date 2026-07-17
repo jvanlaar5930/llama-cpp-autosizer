@@ -178,6 +178,212 @@ public class RecommendationService(
         }
     }
 
+    /// <summary>
+    /// "Rescue" recommendation for catastrophically slow configs (generation speed far below
+    /// target — think 1 t/s against a 30 t/s goal). Asks for drastic, possibly combined speed
+    /// changes: Claude → local LLM → drastic heuristic combo. Null means nothing drastic is
+    /// left to try — the optimizer then declares the hardware insufficient for this model.
+    /// </summary>
+    public async Task<ParameterChange?> GetRescueAsync(
+        OptimizationSession session,
+        OptimizationProfile profile,
+        HardwareInfo hardware,
+        int attempt,
+        int maxAttempts,
+        CancellationToken ct = default)
+    {
+        LogActivity($"Generation speed {session.BestResult!.GenerationRate:F1} t/s is far below the " +
+                    $"{session.TargetTgSpeed:F0} t/s target — rescue attempt {attempt}/{maxAttempts}: " +
+                    "asking for drastic speed changes");
+
+        var prompt = BuildRescuePrompt(session, profile, hardware, attempt, maxAttempts);
+
+        if (cloudAdvisor.IsConfigured)
+        {
+            try
+            {
+                string? content = await cloudAdvisor.CompleteAsync(prompt, ct);
+                var change = content is null ? null : ProcessRescueContent(content, session, "claude-rescue");
+                if (change is not null) return change;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                LogActivity($"Claude rescue call failed ({ex.Message}) — falling back to local model");
+            }
+        }
+
+        if (server.IsRunning)
+        {
+            try
+            {
+                LogActivity("Asking local model for drastic speed changes (rescue)…");
+                var (response, _) = await server.CompleteAsync(new CompletionRequest
+                {
+                    Prompt = prompt,
+                    NPredict = 350,
+                    Temperature = 0.4f,
+                    Stop = ["\n\n", "```"],
+                }, ct);
+                var change = ProcessRescueContent(response.Content, session, "llm-rescue");
+                if (change is not null) return change;
+            }
+            catch (Exception ex)
+            {
+                LogActivity($"Local model rescue call failed ({ex.Message}) — falling back to heuristic");
+            }
+        }
+
+        var drastic = GetDrasticHeuristicRescue(session, hardware);
+        if (drastic is null)
+        {
+            LogActivity("No drastic heuristic moves left to try");
+            return null;
+        }
+        if (RecreatesTestedConfig(session, drastic))
+        {
+            LogActivity($"Drastic heuristic combo {drastic.Describe()} was already benchmarked — " +
+                        "nothing drastic left to try");
+            return null;
+        }
+        LogActivity($"Heuristic rescue: {drastic.Describe()} — \"{drastic.Reasoning}\"");
+        return drastic;
+    }
+
+    // Rescue responses: unlike the final push, a null here just moves to the next recommender
+    // in the chain (only the drastic heuristic running dry ends the rescue). A bare DONE means
+    // this recommender believes no setting change can save the config.
+    private ParameterChange? ProcessRescueContent(string content, OptimizationSession session, string source)
+    {
+        string who = source.StartsWith("claude") ? "Claude" : "Local model";
+        content = content.Trim();
+
+        if (content.Contains("DONE", StringComparison.OrdinalIgnoreCase)
+            && !(content.Contains('{') && content.Contains('}')))
+        {
+            LogActivity($"{who} says no setting change can rescue this speed — trying the next recommender");
+            return null;
+        }
+
+        var change = ParseLlmResponse(content, session.BestSettings!);
+        if (change is null)
+        {
+            LogActivity($"{who}'s rescue response could not be parsed — trying the next recommender");
+            return null;
+        }
+        if (RecreatesTestedConfig(session, change))
+        {
+            LogActivity($"{who}'s rescue suggestion {change.Describe()} was already benchmarked — " +
+                        "trying the next recommender");
+            return null;
+        }
+
+        LogActivity($"{who} rescue: {change.Describe()} — \"{change.Reasoning}\"");
+        return Retag(change, source);
+    }
+
+    /// <summary>
+    /// Fallback rescue combo: chains up to three of the most drastic speed moves that are
+    /// still applicable into one combined change. Static (no server/advisor state) so it is
+    /// directly testable. Null when every drastic lever has already been pulled.
+    /// </summary>
+    public static ParameterChange? GetDrasticHeuristicRescue(
+        OptimizationSession session, HardwareInfo hardware)
+    {
+        var s = session.BestSettings!;
+        bool isMoe = LlamaSettings.IsMoeModel(session.ModelPath);
+
+        var moves = new List<(string Param, object? Old, object? New, string Why)>();
+
+        if (isMoe && s.MoeExpertUsed is null or > 2)
+            moves.Add(("MoeExpertUsed", s.MoeExpertUsed?.ToString() ?? "model default", 2,
+                "minimum active experts is the biggest MoE compute cut"));
+        if (s.ContextSize > 2048)
+            moves.Add(("ContextSize", s.ContextSize, 2048,
+                "a small KV cache frees VRAM for model weights"));
+        if (s.CacheTypeK is not ("q4_0" or "q4_1"))
+            moves.Add(("CacheTypeK", s.CacheTypeK ?? "f16", "q4_0",
+                "smallest KV cache footprint"));
+        if (s.CacheTypeV is not ("q4_0" or "q4_1"))
+            moves.Add(("CacheTypeV", s.CacheTypeV ?? "f16", "q4_0",
+                "smallest KV cache footprint"));
+        if (hardware.HasGpu && s.GpuLayers != -1)
+            moves.Add(("GpuLayers", s.GpuLayers, -1,
+                "full GPU offload once the KV cache shrinks"));
+        if (s.ThinkingEnabled == true)
+            moves.Add(("ThinkingEnabled", true, false,
+                "reasoning tokens are unaffordable at this speed"));
+
+        if (moves.Count == 0) return null;
+
+        var chosen = moves.Take(3).ToList();
+        string summary = "Drastic speed rescue — " + string.Join("; ", chosen.Select(m => m.Why));
+
+        // Build the chain back-to-front; the head carries the combined reasoning.
+        ParameterChange? chain = null;
+        for (int i = chosen.Count - 1; i >= 0; i--)
+        {
+            var m = chosen[i];
+            chain = new ParameterChange
+            {
+                Parameter = m.Param,
+                OldValue = m.Old,
+                NewValue = m.New,
+                Reasoning = i == 0 ? summary : m.Why,
+                Source = "heuristic-rescue",
+                Combined = chain,
+            };
+        }
+        return chain;
+    }
+
+    private static string BuildRescuePrompt(
+        OptimizationSession session, OptimizationProfile profile, HardwareInfo hardware,
+        int attempt, int maxAttempts)
+    {
+        var best = session.BestResult!;
+        var bestSettings = session.Best!.Settings;
+        bool isMoe = LlamaSettings.IsMoeModel(session.ModelPath);
+        bool isThinking = LlamaSettings.IsThinkingModel(session.ModelPath);
+
+        string moeParam = isMoe
+            ? $"\n- MoeExpertUsed: integer (current={bestSettings.MoeExpertUsed?.ToString() ?? "model default"}; 2 is the drastic minimum — biggest MoE compute cut)"
+            : "";
+        string thinkingParam = isThinking
+            ? $"\n- ThinkingEnabled: true or false (current={bestSettings.ThinkingEnabled ?? false}; reasoning tokens are unaffordable at this speed)"
+            : "";
+
+        return $$"""
+You are a llama.cpp performance optimizer in EMERGENCY RESCUE mode (attempt {{attempt}} of {{maxAttempts}}).
+Generation speed is {{best.GenerationRate:F1}} t/s against a {{session.TargetTgSpeed:F0}} t/s target — the current configuration is unusably slow, likely because the model doesn't fit its compute budget (VRAM overflow into system RAM, CPU-bound layers, or paging).
+Suggest the SINGLE most drastic change — or TWO combined via "parameter2"/"value2" — purely to maximize generation speed. Quality is explicitly sacrificed; a usable speed is all that matters right now. Small incremental tweaks are useless here.
+
+HARDWARE:
+- GPU: {{(hardware.HasGpu ? $"{hardware.Gpus.FirstOrDefault()?.Name ?? "GPU"} — {hardware.TotalVramMb} MB total, {hardware.FreeVramMb} MB free (measured with the current model loaded)" : "none (CPU-only)")}}
+- RAM: {{hardware.RamTotalMb}} MB total, {{hardware.RamFreeMb}} MB free
+- CPU: {{hardware.CpuName}} — {{hardware.CpuCores}} cores / {{hardware.CpuThreads}} threads
+
+CURRENT SETTINGS (TG={{best.GenerationRate:F1}}t/s PP={{best.PromptProcessingRate:F0}}t/s):
+- ctx-size: {{bestSettings.ContextSize}}
+- n-gpu-layers: {{bestSettings.GpuLayers}} (-1 = all layers)
+- batch-size: {{bestSettings.BatchSize}} / ubatch-size: {{bestSettings.UBatchSize}}
+- flash-attn: {{bestSettings.FlashAttention}}
+- cache-type-k: {{bestSettings.CacheTypeK ?? "f16"}} / cache-type-v: {{bestSettings.CacheTypeV ?? "f16"}}
+- threads: {{bestSettings.Threads}} / mmap: {{bestSettings.Mmap}} / mlock: {{bestSettings.Mlock}}{{(isMoe ? $"\n- active experts: {bestSettings.MoeExpertUsed?.ToString() ?? "model default"}" : "")}}{{(isThinking ? $"\n- thinking: {bestSettings.ThinkingEnabled ?? false}" : "")}}
+{{PriorRunsPromptSection(session)}}
+Drastic levers, roughly in order of impact:
+- If VRAM is overflowing (model + KV cache > free VRAM), shrink aggressively: ContextSize down to 2048, CacheTypeK/CacheTypeV to "q4_0", then GpuLayers -1 for full offload of what remains
+- If the GPU can't hold enough layers even after shrinking, a LOWER GpuLayers value that leaves the KV cache comfortably in VRAM sometimes beats thrashing
+- CPU-only or CPU-bound: Threads to physical core count, BatchSize/UBatchSize down (e.g. 128/64), Mmap toggled{{moeParam}}{{thinkingParam}}
+
+Valid parameters: GpuLayers, ContextSize, BatchSize, UBatchSize, FlashAttention, CacheTypeK, CacheTypeV, Threads, Mmap, Mlock{{(isMoe ? ", MoeExpertUsed" : "")}}{{(isThinking ? ", ThinkingEnabled" : "")}}
+
+If you are convinced NO setting change can make this model usable on this hardware, respond with exactly: DONE
+Otherwise respond with ONLY this JSON (no markdown, no extra text):
+{"parameter":"<name>","value":<value>,"reasoning":"<one sentence>","parameter2":"<optional second name>","value2":<optional second value>}
+""";
+    }
+
     // Shared handling for final-push responses from either recommender. Null means "nothing
     // more to try" (explicit DONE or unparseable) — the optimizer then checks the heuristic
     // pool before ending the run.

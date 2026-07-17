@@ -6,7 +6,7 @@ public class ParameterChange
     public object? OldValue { get; init; }
     public object? NewValue { get; init; }
     public string Reasoning { get; init; } = "";
-    public string Source { get; init; } = "heuristic";   // "heuristic" | "llm" | "llm-push" | "claude" | "claude-push" | "user"
+    public string Source { get; init; } = "heuristic";   // "heuristic" | "heuristic-rescue" | "llm" | "llm-push" | "llm-rescue" | "claude" | "claude-push" | "claude-rescue" | "user"
 
     // Optional second change applied atomically with this one — used by the final-push
     // recommender to explore parameter combinations a single greedy step can't reach.
