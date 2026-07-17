@@ -595,7 +595,10 @@ public class MainMenu(
         {
             double pct = maxIter > 0 ? (double)iterDone / (maxIter + 1) * 100.0 : 0;
             int barWidth = 30;
-            int filled = (int)(barWidth * pct / 100.0);
+            // iterDone can exceed maxIter+1 — the end-of-run champion verification is one
+            // more yielded iteration beyond the baseline+maxIter the denominator assumes.
+            // Clamp so a >100% reading can never make either string length go negative.
+            int filled = Math.Clamp((int)(barWidth * pct / 100.0), 0, barWidth);
             string bar = $"[cyan]{new string('█', filled)}[/]{new string('░', barWidth - filled)}";
             return $"{bar}  {pct:F0}%  ({iterDone}/{maxIter + 1})";
         }

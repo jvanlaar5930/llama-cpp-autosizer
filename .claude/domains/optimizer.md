@@ -47,6 +47,10 @@ Needs verification — no automated tests exist for the optimizer loop. Validate
 
 Once the best config's TG rate clears `TargetTgSpeed × 1.1` (buffer avoids phase-flipping on noise), the heuristic recommender switches to quality tuning, in order: revert aggressive KV-cache quant (q4/q5 → q8_0; q8_0 → f16 only with ≥ 15 t/s headroom), escalate anti-loop samplers (DRY → 1.05, then repeat-penalty → 1.15) when quality/agent-loop scores show loop symptoms, enable thinking mode (Agentic + thinking-capable models), restore MoE experts, then grow context. Both LLM prompts describe the same phase. The Agentic profile auto-runs the repetition stress test each iteration once the TG target is met, and `BenchmarkService` folds a graded distinct-trigram "repetition health" factor into QualityScore so near-loops are visible before the binary loop detector fires.
 
+## Known Gotchas (UI)
+
+- `MainMenu.BuildProgressLine`'s percentage denominator (`maxIter + 1`, i.e. baseline + `maxIter` iterations) doesn't account for the end-of-run champion verification, which is one more yielded iteration beyond that. Once it lands, `iterDone` exceeds the denominator, pct exceeds 100%, and an unclamped `filled` used to make `new string('░', barWidth - filled)` go negative and crash with `ArgumentOutOfRangeException: count ('-1')`. `filled` is now `Math.Clamp`ed to `[0, barWidth]` — any future source of "more iterations than the bar expected" (rescue attempts, verification, etc.) is safe by construction; don't reintroduce an unclamped `barWidth - filled`.
+
 ## Known Gotchas
 
 - Always read `LlamaServerService.LastEffectiveSettings` after a start attempt rather than assuming the requested `LlamaSettings` took effect — self-healing retries silently revert unsupported values.
