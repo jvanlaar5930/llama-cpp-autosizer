@@ -11,6 +11,18 @@ public class BenchmarkService(
 {
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNameCaseInsensitive = true };
 
+    // Sanity ceilings for reported rates, generous enough to never clip a genuine result
+    // (the fastest consumer/prosumer hardware tops out far below these) but tight enough to
+    // catch the failure mode actually seen: llama-server occasionally reports a near-zero
+    // predicted_ms/prompt_ms for a run (e.g. a degenerate near-instant completion), and
+    // tokens/ms then blows up to something like 1,000,000 t/s. That single corrupted sample
+    // would otherwise dominate the session (falsely "winning" as Best, and — after the
+    // rescue-mode addition — masking genuinely insufficient hardware). Samples exceeding
+    // these are excluded from the rate aggregate; GeneratedText from the same run still
+    // feeds quality/repetition scoring, since that measurement isn't rate-based.
+    private const double MaxPlausibleTgRate = 1000.0;
+    private const double MaxPlausiblePpRate = 50_000.0;
+
     public async Task<BenchmarkResult> RunAsync(
         LlamaSettings settings,
         string modelPath,
@@ -110,20 +122,44 @@ public class BenchmarkService(
 
         // Aggregate. Rates are weighted by tokens/time (not averaged per-run) because a
         // run that generates very few tokens in a tiny amount of time reports an inflated
-        // per_second ratio that would otherwise dominate a plain average.
+        // per_second ratio that would otherwise dominate a plain average. Samples with an
+        // implausible individual rate (server-reported timing anomaly, not real throughput —
+        // see MaxPlausibleTgRate/MaxPlausiblePpRate) are dropped from their respective
+        // aggregate before summing, so one corrupted sample can't produce a fictional result.
+        var genTimings = timings.Where(t => !IsImplausibleRate(t.PredictedTokens, t.PredictedMs, MaxPlausibleTgRate)).ToList();
+        var ppTimings = timings.Where(t => !IsImplausibleRate(t.PromptTokens, t.PromptMs, MaxPlausiblePpRate)).ToList();
+        int excludedCount = timings.Count - Math.Min(genTimings.Count, ppTimings.Count);
+        if (excludedCount > 0)
+        {
+            logger.LogWarning(
+                "Discarded {N} benchmark sample(s) with an implausible server-reported rate (>{TgMax:N0}t/s or >{PpMax:N0}t/s) — likely a near-zero timing glitch, not real throughput",
+                excludedCount, MaxPlausibleTgRate, MaxPlausiblePpRate);
+            result.Notes = (result.Notes is null ? "" : result.Notes + " ") +
+                $"Discarded {excludedCount} sample(s) with an implausible reported rate (timing anomaly).";
+        }
+
+        if (genTimings.Count > 0)
+        {
+            double predictedMs = genTimings.Sum(t => t.PredictedMs);
+            result.GenerationRate = predictedMs > 0
+                ? genTimings.Sum(t => t.PredictedTokens) / predictedMs * 1000.0
+                : 0;
+        }
+        if (ppTimings.Count > 0)
+        {
+            double promptMs = ppTimings.Sum(t => t.PromptMs);
+            result.PromptProcessingRate = promptMs > 0
+                ? ppTimings.Sum(t => t.PromptTokens) / promptMs * 1000.0
+                : 0;
+        }
         if (timings.Count > 0)
         {
-            double promptMs = timings.Sum(t => t.PromptMs);
-            double predictedMs = timings.Sum(t => t.PredictedMs);
-            result.PromptProcessingRate = promptMs > 0
-                ? timings.Sum(t => t.PromptTokens) / promptMs * 1000.0
-                : 0;
-            result.GenerationRate = predictedMs > 0
-                ? timings.Sum(t => t.PredictedTokens) / predictedMs * 1000.0
-                : 0;
             result.TimeToFirstTokenMs = timings.Average(t => t.TimeToFirstTokenMs);
             result.AverageTotalMs = timings.Average(t => t.TotalMs);
         }
+
+        result.ToolCallEffectiveTgRate = ClampRate(result.ToolCallEffectiveTgRate, MaxPlausibleTgRate);
+        result.AgentLoopEffectiveTgRate = ClampRate(result.AgentLoopEffectiveTgRate, MaxPlausibleTgRate);
 
         result.SuccessfulRuns = timings.Count;
         result.FailedRuns = profile.BenchmarkPrompts.Count - timings.Count;
@@ -133,6 +169,17 @@ public class BenchmarkService(
 
         return result;
     }
+
+    // True when tokens/ms implies a rate beyond what real hardware can produce — a
+    // server-reported near-zero timing sample, not genuine throughput.
+    private static bool IsImplausibleRate(double tokens, double ms, double maxPlausibleRate)
+        => ms > 0 && tokens / ms * 1000.0 > maxPlausibleRate;
+
+    // Same anomaly, applied to the wall-clock-derived tool/agent-loop effective rates: zero
+    // out a reading that exceeds the plausible ceiling rather than let a corrupted number
+    // (e.g. from a near-instant cached response) feed the composite score or rescue check.
+    private static double ClampRate(double rate, double maxPlausibleRate)
+        => rate > maxPlausibleRate ? 0 : rate;
 
     private async Task<RunTimings?> RunSinglePromptAsync(
         string prompt, int maxTokens, BenchmarkResult result, CancellationToken ct)
