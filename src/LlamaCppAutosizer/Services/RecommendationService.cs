@@ -202,7 +202,8 @@ public class RecommendationService(
             : "";
 
         string moeParam = isMoe
-            ? $"\n- MoeExpertUsed: integer, e.g. 4, 6, 8, 12 (fewer experts = less VRAM + faster; current={bestSettings.MoeExpertUsed?.ToString() ?? "model default"})"
+            ? $"\n- MoeExpertUsed: integer, e.g. 4, 6, 8, 12 (fewer experts = less VRAM + faster; current={bestSettings.MoeExpertUsed?.ToString() ?? "model default"})" +
+              $"\n- NCpuMoe: integer, 0 = all experts on GPU (current={bestSettings.NCpuMoe?.ToString() ?? "0"}). Keeps the expert weights of the first N layers on the CPU while attention stays on the GPU. LOWER it to move experts back into VRAM (faster, needs free VRAM); RAISE it to free VRAM. Unlike MoeExpertUsed this costs no quality, so prefer it when VRAM is the constraint."
             : "";
 
         // Thinking-capable models (Qwen3/QwQ/DeepSeek-R1) start every run with reasoning
@@ -481,6 +482,12 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
                     int? newExperts = experts == 0 ? null : experts;
                     return (settings.MoeExpertUsed, newExperts != settings.MoeExpertUsed ? newExperts : (object?)null);
 
+                case "NCpuMoe":
+                    // 0 = every layer's experts stay on the GPU (treated as null = don't pass the arg)
+                    int ncmoe = Math.Clamp(value.GetInt32(), 0, 999);
+                    int? newNcmoe = ncmoe == 0 ? null : ncmoe;
+                    return (settings.NCpuMoe, newNcmoe != settings.NCpuMoe ? newNcmoe : (object?)null);
+
                 case "ThinkingEnabled":
                     bool thinking = value.GetBoolean();
                     return (settings.ThinkingEnabled, thinking != settings.ThinkingEnabled ? thinking : (object?)null);
@@ -614,6 +621,18 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
             if (suggestedNgl > bestSettings.GpuLayers)
                 return Change("GpuLayers", bestSettings.GpuLayers, suggestedNgl,
                     "More GPU layers offloads computation to VRAM, improving TG speed");
+        }
+
+        // MoE models with experts parked on the CPU: pulling a few back into VRAM is the single
+        // biggest speed lever available and costs no quality, so it is tried before the
+        // quality-degrading expert-count reduction below. Step by a quarter of the offloaded
+        // layers so a VRAM overshoot fails fast rather than after a long crawl.
+        if (isMoe && bestSettings.NCpuMoe is > 0 && !tried.Contains("NCpuMoe"))
+        {
+            int step = Math.Max(1, bestSettings.NCpuMoe.Value / 4);
+            int fewer = Math.Max(0, bestSettings.NCpuMoe.Value - step);
+            return Change("NCpuMoe", bestSettings.NCpuMoe.Value, fewer == 0 ? null! : fewer,
+                "Moving expert weights off the CPU and back into VRAM raises TG speed at no quality cost");
         }
 
         // MoE models: reducing active experts per token frees VRAM and cuts compute.
@@ -762,6 +781,7 @@ Otherwise respond with ONLY this JSON (no markdown, no extra text; "parameter2"/
             case "Mlock":           s.Mlock = Convert.ToBoolean(change.NewValue); break;
             case "Mmap":            s.Mmap = Convert.ToBoolean(change.NewValue); break;
             case "MoeExpertUsed":   s.MoeExpertUsed = change.NewValue is null ? null : Convert.ToInt32(change.NewValue); break;
+            case "NCpuMoe":         s.NCpuMoe = change.NewValue is null ? null : Convert.ToInt32(change.NewValue); break;
             case "ThinkingEnabled": s.ThinkingEnabled = change.NewValue is null ? null : Convert.ToBoolean(change.NewValue); break;
             case "RepeatPenalty":   s.RepeatPenalty = change.NewValue is null ? null : Convert.ToSingle(change.NewValue); break;
             case "RepeatLastN":     s.RepeatLastN = change.NewValue is null ? null : Convert.ToInt32(change.NewValue); break;

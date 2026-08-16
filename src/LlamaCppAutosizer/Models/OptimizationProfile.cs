@@ -63,8 +63,14 @@ public record class OptimizationProfile
     public string Description { get; init; } = "";
     public ScoringWeights Weights { get; init; } = new(0.4, 0.1, 0.3, 0.2, 0.0);
 
-    // Benchmark parameters
-    public int TargetContextSize { get; init; } = 8192;
+    // Benchmark parameters.
+    // TargetContextSize is a *ceiling* on the baseline context, not a fixed value: the real
+    // starting context is computed per model from its GGUF header and the free VRAM, then capped
+    // here and by the model's own trained context length.
+    public int TargetContextSize { get; init; } = DefaultTargetContext;
+
+    /// <summary>Context the baseline aims for before any per-model VRAM/KV fitting is applied.</summary>
+    public const int DefaultTargetContext = 65536;
     public int MaxGenerateTokens { get; init; } = 256;
     public int WarmupRuns { get; init; } = 2;
 
@@ -85,6 +91,62 @@ public record class OptimizationProfile
         "Number each one and give a full paragraph of justification for each.";
     public int StressTestMaxTokens { get; init; } = 1536;
 
+    // ── Scoring normalization bounds ─────────────────────────────────────────
+    // Defaults suit mid-range hardware. They are deliberately not used raw on a fast machine:
+    // a 4B model on a 4090 clears 80 t/s TG and 2000 t/s PP at baseline, which pins both speed
+    // terms at 1.0 and makes every subsequent speed gain invisible to the optimizer — it would
+    // then spend the rest of the run tuning TTFT and quality while reporting "no improvement"
+    // for changes that genuinely raised throughput. CalibratedTo() rescales them off the
+    // measured baseline so relative improvement stays visible at any hardware tier.
+    public double TgLowerBound { get; init; } = 5;
+    public double TgUpperBound { get; init; } = 80;
+    public double PpLowerBound { get; init; } = 50;
+    public double PpUpperBound { get; init; } = 2000;
+    public double TtftBestMs { get; init; } = 200;
+    public double TtftWorstMs { get; init; } = 5000;
+
+    // Headroom kept above the baseline measurement. 2× means a config would have to double
+    // baseline throughput before the term saturates again — by which point it has already won
+    // decisively, so the lost resolution costs nothing.
+    private const double CalibrationHeadroom = 2.0;
+
+    /// <summary>
+    /// Returns a copy of this profile with its scoring bounds rescaled around the baseline
+    /// measurement. Bounds only ever widen (<c>Math.Max</c>/<c>Math.Min</c> against the
+    /// defaults), so slow hardware scores exactly as it does today. A degenerate baseline
+    /// (no successful generation) leaves the profile unchanged.
+    /// </summary>
+    public OptimizationProfile CalibratedTo(BenchmarkResult baseline)
+    {
+        if (baseline.GenerationRate <= 0) return this;
+
+        double ttftBest = baseline.TimeToFirstTokenMs > 0
+            ? Math.Min(TtftBestMs, baseline.TimeToFirstTokenMs / CalibrationHeadroom)
+            : TtftBestMs;
+        // Unlike the rate bounds, TTFT's "worst" end also has to track the baseline: the default
+        // 200–5000 ms span is so wide that an 80 ms baseline scores 0.98 and leaves no room to
+        // register an improvement.
+        double ttftWorst = Math.Max(ttftBest * CalibrationHeadroom,
+            baseline.TimeToFirstTokenMs > 0
+                ? baseline.TimeToFirstTokenMs * CalibrationHeadroom
+                : TtftWorstMs);
+
+        return this with
+        {
+            TgUpperBound = Math.Max(TgUpperBound, baseline.GenerationRate * CalibrationHeadroom),
+            PpUpperBound = baseline.PromptProcessingRate > 0
+                ? Math.Max(PpUpperBound, baseline.PromptProcessingRate * CalibrationHeadroom)
+                : PpUpperBound,
+            TtftBestMs = ttftBest,
+            TtftWorstMs = ttftWorst,
+        };
+    }
+
+    /// <summary>Human-readable description of the active scoring bounds, for the run log.</summary>
+    public string DescribeScoringBounds() =>
+        $"TG {TgLowerBound:F0}–{TgUpperBound:F0} t/s, PP {PpLowerBound:F0}–{PpUpperBound:F0} t/s, " +
+        $"TTFT {TtftWorstMs:F0}→{TtftBestMs:F0} ms";
+
     // -------------------------------------------------------------------------
     // Built-in profiles
     // -------------------------------------------------------------------------
@@ -95,7 +157,7 @@ public record class OptimizationProfile
         Name = "Chat",
         Description = "Low latency, responsive generation — ideal for interactive conversations",
         Weights = new(TgSpeed: 0.35, PpSpeed: 0.10, TimeToFirstToken: 0.35, Quality: 0.20, ToolSuccess: 0.00, AgentLoop: 0.00),
-        TargetContextSize = 8192,
+        TargetContextSize = DefaultTargetContext,
         MaxGenerateTokens = 256,
         WarmupRuns = 2,
         WarmupPrompts =
@@ -122,7 +184,7 @@ public record class OptimizationProfile
         Name = "Agentic",
         Description = "High throughput, reliable structured outputs — ideal for tool-calling agent loops",
         Weights = new(TgSpeed: 0.10, PpSpeed: 0.20, TimeToFirstToken: 0.10, Quality: 0.15, ToolSuccess: 0.20, AgentLoop: 0.25),
-        TargetContextSize = 32768,
+        TargetContextSize = DefaultTargetContext,
         MaxGenerateTokens = 512,
         WarmupRuns = 1,
         WarmupPrompts =
@@ -299,9 +361,9 @@ public record class OptimizationProfile
 
     public double ScoreResult(BenchmarkResult result)
     {
-        double tgScore = NormalizeRate(result.GenerationRate, lower: 5, upper: 80);
-        double ppScore = NormalizeRate(result.PromptProcessingRate, lower: 50, upper: 2000);
-        double ttftScore = NormalizeTtft(result.TimeToFirstTokenMs, worst: 5000, best: 200);
+        double tgScore = NormalizeRate(result.GenerationRate, lower: TgLowerBound, upper: TgUpperBound);
+        double ppScore = NormalizeRate(result.PromptProcessingRate, lower: PpLowerBound, upper: PpUpperBound);
+        double ttftScore = NormalizeTtft(result.TimeToFirstTokenMs, worst: TtftWorstMs, best: TtftBestMs);
         double qualityScore = result.QualityScore;
         double toolScore = result.ToolSuccessRate;
         double agentLoopScore = result.AgentLoopScore;

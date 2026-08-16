@@ -347,14 +347,19 @@ public class MainMenu(
         }
         else
         {
-            initialSettings = OptimizerService.BuildInitialSettings(_modelPath, _profile, _hardware);
-
-            // Hardware presets never set a KV cache type (they leave it at the f16 default).
             // Carry forward whatever cache type was last chosen via "Edit llama.cpp Settings
             // Manually" or the TurboQuant cache-type screen — otherwise those choices are
             // silently discarded the moment you start a fresh (non-profile) optimization run.
-            if (_manualSettings.CacheTypeK is not null) initialSettings.CacheTypeK = _manualSettings.CacheTypeK;
+            // It goes *into* the planner rather than being applied afterwards, because the KV
+            // type determines how much VRAM is left for weights: overriding it after the fact
+            // would leave the computed layer counts sized for a different KV footprint.
+            var plan = OptimizerService.BuildInitialPlan(
+                _modelPath, _profile, _hardware, _manualSettings.CacheTypeK);
+            initialSettings = plan.Settings;
             if (_manualSettings.CacheTypeV is not null) initialSettings.CacheTypeV = _manualSettings.CacheTypeV;
+
+            AnsiConsole.MarkupLine($"[grey]Baseline computed for this model:[/] {Markup.Escape(plan.Explanation)}");
+            AnsiConsole.WriteLine();
         }
 
         // Show and allow override
