@@ -102,9 +102,15 @@ public class LlamaSettings
                 args.Add($"{arch}.expert_used_count=int:{MoeExpertUsed.Value}");
             }
         }
-        // Thinking is a runtime/chat-template concern, not GGUF metadata. llama-server exposes it
-        // as a token budget: 0 ends the thinking block immediately, -1 leaves it unrestricted.
-        if (ThinkingEnabled.HasValue) { args.Add("--reasoning-budget"); args.Add(ThinkingEnabled.Value ? "-1" : "0"); }
+        if (ThinkingEnabled.HasValue)
+        {
+            // --override-kv can't toggle thinking (enable_thinking is a chat-template variable,
+            // not GGUF metadata). Pass it as a template kwarg; when disabling, also zero the
+            // reasoning budget — some models keep emitting thinking blocks on kwargs alone.
+            args.Add("--chat-template-kwargs");
+            args.Add($"{{\"enable_thinking\":{ThinkingEnabled.Value.ToString().ToLower()}}}");
+            if (!ThinkingEnabled.Value) { args.Add("--reasoning-budget"); args.Add("0"); }
+        }
         if (DefragThreshold >= 0) { args.Add("--defrag-thold"); args.Add(DefragThreshold.ToString("F2")); }
         if (RopeScaling is not null) { args.Add("--rope-scaling"); args.Add(RopeScaling); }
         if (RopeFreqBase.HasValue) { args.Add("--rope-freq-base"); args.Add(RopeFreqBase.Value.ToString()); }

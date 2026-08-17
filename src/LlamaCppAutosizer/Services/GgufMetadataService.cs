@@ -318,10 +318,14 @@ public static class GgufMetadataService
         return null;
     }
 
+    // Sanity cap only — an embedded jinja chat template can legitimately run to hundreds of KB,
+    // so this has to be well clear of that or valid models fail to parse.
+    private const ulong MaxStringBytes = 16 * 1024 * 1024;
+
     private static string ReadString(BinaryReader br)
     {
         ulong len = br.ReadUInt64();
-        if (len > 1_000_000) throw new InvalidDataException("implausible GGUF string length");
+        if (len > MaxStringBytes) throw new InvalidDataException("implausible GGUF string length");
         return Encoding.UTF8.GetString(br.ReadBytes((int)len));
     }
 

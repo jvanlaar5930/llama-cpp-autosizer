@@ -49,15 +49,121 @@ public class HardwareDetectionService(ILogger<HardwareDetectionService> logger)
             return gpus;
         }
 
-        // Try Intel Arc / integrated via dxdiag on Windows
+        // Windows fallback for GPUs without a vendor CLI (Intel Arc, AMD without rocm-smi,
+        // NVIDIA with nvidia-smi missing from PATH). Registry first — wmic's AdapterRAM is
+        // a uint32 that silently clamps every card larger than 4 GB to 4095 MB, which then
+        // flows into recommendation prompts as "a 4GB GPU".
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            var intelGpus = await TryWmicGpuAsync();
-            gpus.AddRange(intelGpus);
+            var regGpus = await TryWindowsRegistryGpusAsync();
+            if (regGpus.Count > 0)
+            {
+                gpus.AddRange(regGpus);
+                return gpus;
+            }
+
+            var wmicGpus = await TryWmicGpuAsync();
+            gpus.AddRange(wmicGpus);
         }
 
         return gpus;
     }
+
+    // Reads total VRAM from the display-adapter class registry keys:
+    // HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-…}\NNNN\HardwareInformation.qwMemorySize
+    // qwMemorySize is a QWORD, so — unlike Win32_VideoController.AdapterRAM — it reports the
+    // true size for cards above 4 GB. Vendor-agnostic (NVIDIA / AMD / Intel).
+    private async Task<List<GpuInfo>> TryWindowsRegistryGpusAsync()
+    {
+        if (!OperatingSystem.IsWindows()) return [];
+        try
+        {
+            using var displayClass = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                @"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}");
+            if (displayClass is null) return [];
+
+            // Stale driver entries can list the same adapter twice — keep the largest reading.
+            var byName = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+            foreach (var subKeyName in displayClass.GetSubKeyNames())
+            {
+                if (subKeyName.Length == 0 || !subKeyName.All(char.IsAsciiDigit)) continue; // skip "Properties"
+                using var adapter = displayClass.OpenSubKey(subKeyName);
+                if (adapter?.GetValue("DriverDesc") is not string name || string.IsNullOrWhiteSpace(name))
+                    continue;
+
+                long bytes = adapter.GetValue("HardwareInformation.qwMemorySize") switch
+                {
+                    long qw => qw,
+                    int dw => (uint)dw,
+                    byte[] { Length: >= 8 } raw => BitConverter.ToInt64(raw, 0),
+                    _ => 0,
+                };
+                if (bytes <= 0) continue;
+
+                long mb = bytes / (1024 * 1024);
+                byName[name] = Math.Max(byName.GetValueOrDefault(name), mb);
+            }
+            if (byName.Count == 0) return [];
+
+            // Free VRAM isn't in the registry; measure total dedicated usage via perf
+            // counters. With a single adapter that gives real headroom; with several we
+            // can't attribute usage per adapter, so fall back to reporting total as free.
+            long usedMb = byName.Count == 1 ? await TryDedicatedVramUsedMbAsync() : 0;
+
+            int index = 0;
+            return byName.Select(kv => new GpuInfo
+            {
+                Name = kv.Key,
+                VramTotalMb = kv.Value,
+                VramFreeMb = usedMb > 0 ? Math.Max(0, kv.Value - usedMb) : kv.Value,
+                Vendor = GuessVendor(kv.Key),
+                Index = index++,
+            }).ToList();
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug("Registry GPU query failed: {Msg}", ex.Message);
+            return [];
+        }
+    }
+
+    // Sums "\GPU Adapter Memory(*)\Dedicated Usage" (bytes) across all adapters via
+    // typeperf. Returns 0 when unavailable (older Windows, localized counter names) —
+    // callers then report total as free, same as the old wmic behavior.
+    private async Task<long> TryDedicatedVramUsedMbAsync()
+    {
+        try
+        {
+            var output = await RunCommandAsync(
+                "typeperf", "\"\\GPU Adapter Memory(*)\\Dedicated Usage\" -sc 1");
+
+            long totalBytes = 0;
+            foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                // Sample lines are CSV: "timestamp","123456","789",… — headers contain the
+                // counter path, so only parse lines whose non-first fields are all numeric.
+                if (!line.StartsWith('"') || line.Contains("Dedicated Usage")) continue;
+                var fields = line.Split(',').Select(f => f.Trim().Trim('"')).Skip(1);
+                foreach (var field in fields)
+                {
+                    if (double.TryParse(field, System.Globalization.CultureInfo.InvariantCulture, out double v))
+                        totalBytes += (long)v;
+                }
+            }
+            return totalBytes / (1024 * 1024);
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug("GPU perf-counter query failed: {Msg}", ex.Message);
+            return 0;
+        }
+    }
+
+    private static string GuessVendor(string name) =>
+        name.Contains("NVIDIA", StringComparison.OrdinalIgnoreCase) || name.Contains("GeForce", StringComparison.OrdinalIgnoreCase) ? "NVIDIA"
+        : name.Contains("AMD", StringComparison.OrdinalIgnoreCase) || name.Contains("Radeon", StringComparison.OrdinalIgnoreCase) ? "AMD"
+        : name.Contains("Intel", StringComparison.OrdinalIgnoreCase) || name.Contains("Arc", StringComparison.OrdinalIgnoreCase) ? "Intel"
+        : "Unknown";
 
     private async Task<List<GpuInfo>> TryNvidiaSmiAsync()
     {
@@ -151,6 +257,12 @@ public class HardwareDetectionService(ILogger<HardwareDetectionService> logger)
                 string name = parts[2].Trim();
                 if (string.IsNullOrEmpty(name)) continue;
                 long.TryParse(parts[1].Trim(), out var adapterRamBytes);
+                // AdapterRAM is a uint32 — any card over 4 GB reads as exactly ~4095 MB.
+                // This path only runs when the registry query above already failed, so
+                // there's nothing better to substitute; log it so a "4GB GPU" appearing
+                // in recommendation prompts is traceable to this clamp.
+                if (adapterRamBytes >= 0xFFF0_0000)
+                    logger.LogDebug("wmic AdapterRAM clamped at 4GB for {Name} — real VRAM is likely larger", name);
                 gpus.Add(new GpuInfo
                 {
                     Name = name,

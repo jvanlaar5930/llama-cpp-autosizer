@@ -8,6 +8,7 @@ public class MainMenu(
     HardwareDetectionService hwService,
     OptimizerService optimizer,
     LlamaServerService llamaServer,
+    RecommendationService recommender,
     SessionPersistenceService persistence,
     ProfileLibraryService profileLibrary,
     ProfileMenu profileMenu,
@@ -444,6 +445,9 @@ public class MainMenu(
         // to toggle between the two.
         var logQueue = new System.Collections.Concurrent.ConcurrentQueue<string>();
         llamaServer.SetLogHandler(logQueue.Enqueue);
+        // Recommender activity (which model was asked — Claude / local LLM / heuristic —
+        // and what each determined) lands in the same rolling log, prefixed for scanning.
+        recommender.SetActivityLog(line => logQueue.Enqueue($"[advisor] {line}"));
 
         // Updated from OptimizerService/BenchmarkService as they move through phases (hardware
         // detection, server start, which benchmark prompt/case is running, LLM recommendation
@@ -456,7 +460,7 @@ public class MainMenu(
             appSettings.EffectiveServerExecutable, _modelPath, initialSettings, _profile, session, opts,
             onPhase: p => currentPhase = p, cts.Token);
 
-        AnsiConsole.Write(new Rule("[grey dim]llama-server log (scroll up for history) — L: toggle full/truncated[/]").RuleStyle("grey dim"));
+        AnsiConsole.Write(new Rule("[grey dim]llama-server & advisor log (scroll up for history) — L: toggle full/truncated[/]").RuleStyle("grey dim"));
 
         int footerLineCount = 0;
         int spinnerFrame = 0;
@@ -499,7 +503,11 @@ public class MainMenu(
             if (showFullLog)
             {
                 for (int i = printedCount; i < allLogs.Count; i++)
-                    AnsiConsole.MarkupLine($"[grey]{Markup.Escape(allLogs[i])}[/]");
+                {
+                    // Advisor traffic stands out from llama-server noise
+                    string color = allLogs[i].StartsWith("[advisor]") ? "cyan" : "grey";
+                    AnsiConsole.MarkupLine($"[{color}]{Markup.Escape(allLogs[i])}[/]");
+                }
                 printedCount = allLogs.Count;
             }
         }
@@ -511,7 +519,7 @@ public class MainMenu(
             int width = Math.Max(40, Console.WindowWidth);
             int innerWidth = Math.Max(10, width - 4);
 
-            string header = $" llama-server log (last {MaxTruncatedLines}) ";
+            string header = $" llama-server & advisor log (last {MaxTruncatedLines}) ";
             int dashCount = Math.Max(0, width - header.Length - 3);
 
             var lines = new List<string> { $"[white]╭─{header}{new string('─', dashCount)}╮[/]" };
@@ -519,7 +527,8 @@ public class MainMenu(
             {
                 string clipped = raw.Length > innerWidth ? raw[..innerWidth] : raw;
                 string padded = clipped.PadRight(innerWidth);
-                lines.Add($"[white]│[/] [grey]{Markup.Escape(padded)}[/] [white]│[/]");
+                string color = raw.StartsWith("[advisor]") ? "cyan" : "grey";
+                lines.Add($"[white]│[/] [{color}]{Markup.Escape(padded)}[/] [white]│[/]");
             }
             lines.Add($"[white]╰{new string('─', width - 2)}╯[/]");
 
@@ -622,6 +631,7 @@ public class MainMenu(
         DrainLogs();
 
         llamaServer.SetLogHandler(null);
+        recommender.SetActivityLog(null);
 
         AnsiConsole.WriteLine();
         BenchmarkDisplay.RenderFinalResults(session, appSettings.EffectiveServerExecutable);

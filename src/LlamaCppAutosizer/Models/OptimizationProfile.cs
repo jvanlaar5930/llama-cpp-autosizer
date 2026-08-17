@@ -92,18 +92,19 @@ public record class OptimizationProfile
     public int StressTestMaxTokens { get; init; } = 1536;
 
     // ── Scoring normalization bounds ─────────────────────────────────────────
-    // Defaults suit mid-range hardware. They are deliberately not used raw on a fast machine:
-    // a 4B model on a 4090 clears 80 t/s TG and 2000 t/s PP at baseline, which pins both speed
-    // terms at 1.0 and makes every subsequent speed gain invisible to the optimizer — it would
-    // then spend the rest of the run tuning TTFT and quality while reporting "no improvement"
-    // for changes that genuinely raised throughput. CalibratedTo() rescales them off the
-    // measured baseline so relative improvement stays visible at any hardware tier.
+    // Wide enough to cover current hardware, but still fixed — and any fixed bound eventually
+    // saturates: once a baseline sits at the top of the range both speed terms pin at 1.0 and
+    // further throughput gains become invisible to the optimizer, which then reports "no
+    // improvement" for changes that genuinely made the model faster. CalibratedTo() rescales
+    // these off the measured baseline so relative improvement stays visible at any tier.
+    // TTFT is the server-reported prompt-eval time (see BenchmarkService), typically 50–500 ms
+    // on GPU — these bounds are sized to that, not to full-response wall time.
     public double TgLowerBound { get; init; } = 5;
-    public double TgUpperBound { get; init; } = 80;
+    public double TgUpperBound { get; init; } = 300;
     public double PpLowerBound { get; init; } = 50;
-    public double PpUpperBound { get; init; } = 2000;
-    public double TtftBestMs { get; init; } = 200;
-    public double TtftWorstMs { get; init; } = 5000;
+    public double PpUpperBound { get; init; } = 10000;
+    public double TtftBestMs { get; init; } = 50;
+    public double TtftWorstMs { get; init; } = 3000;
 
     // Headroom kept above the baseline measurement. 2× means a config would have to double
     // baseline throughput before the term saturates again — by which point it has already won
@@ -353,6 +354,36 @@ public record class OptimizationProfile
             Prompt = "Complete the sequence and reply with only the next number: 2, 4, 8, 16, ...",
             AcceptableAnswers = ["32"],
         },
+        new()
+        {
+            Prompt = "What is 9 multiplied by 14? Reply with only the number.",
+            AcceptableAnswers = ["126"],
+        },
+        new()
+        {
+            Prompt = "How many days are in a leap year? Reply with only the number.",
+            AcceptableAnswers = ["366"],
+        },
+        new()
+        {
+            Prompt = "Which planet is closest to the sun? Reply with only the planet name.",
+            AcceptableAnswers = ["Mercury"],
+        },
+        new()
+        {
+            Prompt = "Alphabetically, which word comes first: zebra or apple? Reply with only that word.",
+            AcceptableAnswers = ["apple"],
+        },
+        new()
+        {
+            Prompt = "Complete the sequence and reply with only the next number: 1, 1, 2, 3, 5, 8, ...",
+            AcceptableAnswers = ["13"],
+        },
+        new()
+        {
+            Prompt = "How many hours are in three days? Reply with only the number.",
+            AcceptableAnswers = ["72"],
+        },
     ];
 
     // -------------------------------------------------------------------------
@@ -378,8 +409,12 @@ public record class OptimizationProfile
             0, 1);
     }
 
+    // Log-scale so resolution is preserved across the whole range: on fast hardware a linear
+    // scale with a low ceiling clamps every config to 1.0 and the optimizer goes blind to
+    // real speed differences (which then read as "no improvement" and end the run early).
     static double NormalizeRate(double actual, double lower, double upper)
-        => Math.Clamp((actual - lower) / (upper - lower), 0, 1);
+        => actual <= lower ? 0
+         : Math.Clamp(Math.Log(actual / lower) / Math.Log(upper / lower), 0, 1);
 
     static double NormalizeTtft(double actualMs, double worst, double best)
         => Math.Clamp((worst - actualMs) / (worst - best), 0, 1);

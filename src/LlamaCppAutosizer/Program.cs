@@ -19,6 +19,7 @@ services.AddSingleton<AppSettingsService>();
 services.AddSingleton<HardwareDetectionService>();
 services.AddSingleton<LlamaServerService>();
 services.AddSingleton<BenchmarkService>();
+services.AddSingleton<CloudAdvisorService>();
 services.AddSingleton<RecommendationService>();
 services.AddSingleton<OptimizerService>();
 services.AddSingleton<TurboQuantService>();
