@@ -121,8 +121,12 @@ public static class SettingsEditor
                     // null = use model default; reducing expert count lowers memory and speeds
                     // inference at the cost of quality (e.g. 8 → 4 on a 256-expert model)
                     int defaultExperts = s.MoeExpertUsed ?? 0;
+                    var meta = Services.GgufMetadataService.Read(modelPath);
+                    string hint = meta?.ExpertUsedCount is int used
+                        ? $"0 = use model default ({used} of {meta.ExpertCount} experts)"
+                        : "0 = use model default";
                     int newExperts = PromptInt(
-                        "Active experts per token (0 = use model default, e.g. 8 for Mixtral 8x7B)", defaultExperts, 0, 256);
+                        $"Active experts per token ({hint})", defaultExperts, 0, meta?.ExpertCount ?? 256);
                     s.MoeExpertUsed = newExperts == 0 ? null : newExperts;
                     break;
                 case "Thinking Mode (CoT)":

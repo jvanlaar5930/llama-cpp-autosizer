@@ -58,6 +58,18 @@ public class OptimizerService(
             onPhase?.Invoke("Running baseline benchmark…");
             var baselineResult = await benchmarks.RunAsync(effectiveInitialSettings, modelPath, profile, ct,
                 options.IncludeRepetitionStressTest, onPhase);
+
+            // Rescale the scoring bounds around what this machine actually produced, before
+            // anything is scored — otherwise fast hardware saturates the speed terms at 1.0 and
+            // the optimizer goes blind to exactly the throughput gains it is meant to find.
+            // Calibrating here (rather than after) means the baseline and every later iteration
+            // are scored on one identical scale, so no rescoring of history is needed.
+            // CalibratedTo returns a copy: the caller's profile instance is long-lived and
+            // reused across runs, so it must not pick up this run's bounds.
+            profile = profile.CalibratedTo(baselineResult);
+            logger.LogInformation("Scoring bounds calibrated to baseline: {Bounds}",
+                profile.DescribeScoringBounds());
+
             baselineResult.CompositeScore = profile.ScoreResult(baselineResult);
             baselineResult.Notes = "Baseline";
 
@@ -451,94 +463,250 @@ public class OptimizerService(
     }
 
     /// <summary>
-    /// Build a good initial set of settings using hardware info and model size.
-    /// Uses a VRAM-tier preset table so the baseline is conservative enough to
-    /// actually start, rather than computing GPU layers with rough math that can
-    /// over-commit VRAM.
+    /// Explains how a baseline was arrived at, so the UI and session log can show the reasoning
+    /// rather than an unexplained set of numbers.
     /// </summary>
-    public static LlamaSettings BuildInitialSettings(
-        string modelPath, OptimizationProfile profile, HardwareInfo hw)
+    public record BaselinePlan(LlamaSettings Settings, string Explanation);
+
+    /// <summary>
+    /// Build the starting configuration for a run, computed from the selected model's own GGUF
+    /// header rather than from file-size guesswork.
+    ///
+    /// The goal is the largest context that still leaves the model running mostly on the GPU.
+    /// Concretely, for the chosen model we read its real layer count, per-layer KV-head counts,
+    /// attention head dimensions and sliding-window pattern, then compute the exact KV cache cost
+    /// at each candidate context and spend whatever VRAM is left on weights. Nothing here is
+    /// architecture-specific: a dense model, a GQA model and a sliding-window MoE all fall out of
+    /// the same arithmetic, they just land on different answers.
+    ///
+    /// If the header can't be read the old file-size tier presets are used unchanged, so an
+    /// unreadable or non-GGUF model still produces the baseline it always did.
+    /// </summary>
+    /// <param name="preferredKvType">
+    /// When the user has already chosen a KV cache type by hand, pass it here so the layer budget
+    /// is computed against that type's actual cost. Overriding the cache type after planning
+    /// would leave the ngl/n-cpu-moe numbers sized for a different KV footprint.
+    /// </param>
+    public static BaselinePlan BuildInitialPlan(
+        string modelPath, OptimizationProfile profile, HardwareInfo hw,
+        string? preferredKvType = null)
     {
         long modelSizeMb = new FileInfo(modelPath).Length / (1024 * 1024);
-
-        // Rough layer count — used only to estimate MB-per-layer for ngl calculation.
-        int estimatedLayers = modelSizeMb switch
-        {
-            < 2000  => 24,   // ~1B
-            < 5000  => 32,   // ~3–7B
-            < 10000 => 40,   // ~8–13B
-            < 20000 => 60,   // ~14–30B
-            _       => 80,   // ~34–70B+
-        };
-
-        double mbPerLayer = (double)modelSizeMb / estimatedLayers;
-
+        var meta = GgufMetadataService.Read(modelPath);
         int threads = hw.CpuCores > 0 ? hw.CpuCores : -1;
-
         bool isThinking = LlamaSettings.IsThinkingModel(modelPath);
+
+        LlamaSettings Base() => new()
+        {
+            Threads         = threads,
+            ThreadsBatch    = threads,
+            Mmap            = true,
+            ThinkingEnabled = isThinking ? false : null,
+            RepeatPenalty   = DefaultRepeatPenalty,
+            RepeatLastN     = DefaultRepeatLastN,
+            DryMultiplier   = DefaultDryMultiplier,
+            Label           = "baseline",
+        };
 
         if (!hw.HasGpu)
         {
-            // CPU-only: use RAM-based presets; no GPU offload
             var cpuPreset = CpuPreset(hw.RamFreeMb);
-            return new LlamaSettings
-            {
-                GpuLayers      = 0,
-                ContextSize    = Math.Min(cpuPreset.CtxSize, profile.TargetContextSize),
-                BatchSize      = cpuPreset.Batch,
-                UBatchSize     = cpuPreset.UBatch,
-                Threads        = threads,
-                ThreadsBatch   = threads,
-                FlashAttention = false,
-                Mmap           = true,
-                ThinkingEnabled = isThinking ? false : null,
-                RepeatPenalty  = DefaultRepeatPenalty,
-                RepeatLastN    = DefaultRepeatLastN,
-                DryMultiplier  = DefaultDryMultiplier,
-                Label          = "baseline",
-            };
+            var cpu = Base();
+            cpu.GpuLayers      = 0;
+            cpu.ContextSize    = Math.Min(cpuPreset.CtxSize, profile.TargetContextSize);
+            cpu.BatchSize      = cpuPreset.Batch;
+            cpu.UBatchSize     = cpuPreset.UBatch;
+            cpu.FlashAttention = false;
+            return new BaselinePlan(cpu,
+                $"CPU-only: {cpu.ContextSize:N0} ctx from the {hw.RamFreeMb:N0} MB free-RAM tier.");
         }
 
-        // GPU path — select preset tier from free VRAM
         var preset = GpuPreset(hw.FreeVramMb);
 
-        // Calculate GPU layers: leave 'preset.ReserveMb' free for KV cache + overhead.
+        // ── No header: keep the historical tier-preset behaviour ─────────────
+        if (meta?.BlockCount is not > 0)
+            return LegacyGpuBaseline(Base(), preset, modelSizeMb, profile, hw);
+
+        int layers = meta.BlockCount.Value;
+        double mbPerLayer = (double)modelSizeMb / layers;
+
+        // Usable VRAM: free, minus a slice for the CUDA/HIP context, kernels, compute buffers and
+        // allocator fragmentation. Overshooting here is what makes a baseline fail to start, so
+        // the margin is deliberately generous — the optimizer can reclaim it later.
+        long usableVram = (long)(hw.FreeVramMb * (1 - VramSafetyFraction)) - GpuOverheadMb;
+
+        // Expert FFN weights dominate an MoE model, and they are the part that can be pushed to
+        // the CPU without evicting attention. Split the per-layer cost so the two can be budgeted
+        // separately; for a dense model expertShare is 0 and this collapses to "all weights".
+        double expertShare = meta.ExpertShareOfLayer();
+        bool useCpuMoeOffload = expertShare >= MinExpertShareForOffload;
+        double expertMbPerLayer = mbPerLayer * expertShare;
+        double nonExpertMbPerLayer = mbPerLayer - expertMbPerLayer;
+        long nonExpertTotalMb = (long)(nonExpertMbPerLayer * layers);
+
+        // Context ladder, highest first. The model's own trained context is a hard ceiling —
+        // asking for more than it was trained for wastes VRAM on KV that RoPE can't use well.
+        int ceiling = Math.Min(profile.TargetContextSize, meta.ContextLength ?? int.MaxValue);
+        var ladder = ContextLadder(ceiling);
+
+        // Evaluates one (context, KV type) pair. Returns null when it doesn't fit well enough
+        // to be worth starting from.
+        Candidate? Evaluate(int ctx, string? kvType)
+        {
+            long kvMb = meta.KvCacheBytes(ctx, kvType, kvType, preset.UBatch) / (1024 * 1024);
+            long weightBudget = usableVram - kvMb;
+            if (weightBudget <= 0) return null;
+
+            if (useCpuMoeOffload)
+            {
+                // Attention and dense weights must all fit, otherwise CPU-MoE offload isn't the
+                // right tool and a smaller context should be tried instead.
+                if (weightBudget < nonExpertTotalMb) return null;
+
+                int expertLayersOnGpu = expertMbPerLayer > 0
+                    ? (int)((weightBudget - nonExpertTotalMb) / expertMbPerLayer)
+                    : layers;
+                expertLayersOnGpu = Math.Clamp(expertLayersOnGpu, 0, layers);
+
+                int? nCpuMoe = layers - expertLayersOnGpu;
+                if (nCpuMoe == 0) nCpuMoe = null;
+
+                return new Candidate(ctx, kvType, kvMb, -1, nCpuMoe,
+                    (double)expertLayersOnGpu / layers,
+                    nCpuMoe is null
+                        ? "whole model fits in VRAM"
+                        : $"{expertLayersOnGpu}/{layers} layers keep their experts in VRAM, " +
+                          $"--n-cpu-moe {nCpuMoe} sends the rest to CPU (attention stays on GPU)");
+            }
+
+            int fits = mbPerLayer > 0 ? (int)(weightBudget / mbPerLayer) : layers;
+            if (fits < Math.Max(1, layers / 4)) return null;   // too little on GPU to be worth it
+
+            int ngl = fits >= layers ? -1 : fits;
+            return new Candidate(ctx, kvType, kvMb, ngl, null,
+                Math.Min(1.0, (double)fits / layers),
+                ngl == -1 ? "whole model fits in VRAM" : $"{ngl}/{layers} layers offloaded");
+        }
+
+        foreach (int ctx in ladder)
+        {
+            // Context first, then GPU residency, then KV precision. Once the target context is
+            // met, VRAM spent on f16 KV is VRAM not spent on weights — and resident weights buy
+            // far more speed than KV precision buys quality. So q8_0 is taken only when it
+            // actually moves a meaningful share of the model onto the GPU; when the difference is
+            // marginal (a layer or two) f16 is kept for its better quality.
+            Candidate? pick;
+            if (preferredKvType is not null)
+            {
+                // The user picked a cache type explicitly — fit around it rather than second-guess it.
+                pick = Evaluate(ctx, preferredKvType);
+            }
+            else
+            {
+                var f16 = Evaluate(ctx, null);
+                var q8 = Evaluate(ctx, "q8_0");
+                pick = (f16, q8) switch
+                {
+                    (null, null) => null,
+                    (null, var q) => q,
+                    (var f, null) => f,
+                    var (f, q) => q!.ResidentFraction - f!.ResidentFraction >= MinResidencyGainForKvQuant ? q : f,
+                };
+            }
+            if (pick is null) continue;
+
+            var s = Base();
+            s.ContextSize    = pick.Context;
+            s.GpuLayers      = pick.GpuLayers;
+            s.NCpuMoe        = pick.NCpuMoe;
+            s.BatchSize      = preset.Batch;
+            s.UBatchSize     = preset.UBatch;
+            // Flash attention cuts attention memory and is a prerequisite for quantized KV.
+            s.FlashAttention = true;
+            s.CacheTypeK     = pick.KvType;
+            s.CacheTypeV     = pick.KvType;
+
+            return new BaselinePlan(s,
+                $"{pick.Context:N0} ctx (model max {meta.ContextLength:N0}) · KV {pick.KvType ?? "f16"} " +
+                $"≈ {pick.KvMb:N0} MB · {pick.How} · {hw.FreeVramMb:N0} MB VRAM free");
+        }
+
+        // Nothing on the ladder fit — fall back to the smallest context and let the server's
+        // self-healing/start-failure path report what actually went wrong.
+        var minimal = Base();
+        minimal.ContextSize    = ladder[^1];
+        minimal.GpuLayers      = 0;
+        minimal.BatchSize      = preset.Batch;
+        minimal.UBatchSize     = preset.UBatch;
+        minimal.FlashAttention = true;
+        return new BaselinePlan(minimal,
+            $"Model does not fit in {hw.FreeVramMb:N0} MB VRAM at any context — starting on CPU " +
+            $"at {minimal.ContextSize:N0} ctx.");
+    }
+
+    /// <summary>Backwards-compatible entry point — returns just the settings.</summary>
+    public static LlamaSettings BuildInitialSettings(
+        string modelPath, OptimizationProfile profile, HardwareInfo hw)
+        => BuildInitialPlan(modelPath, profile, hw).Settings;
+
+    // Descending context candidates, starting at the ceiling. Powers of two down to 2048 so a
+    // step-down halves KV cost rather than shaving it.
+    private static int[] ContextLadder(int ceiling)
+    {
+        int[] all = [131072, 65536, 32768, 16384, 8192, 4096, 2048];
+        var usable = all.Where(c => c <= ceiling).ToArray();
+        return usable.Length > 0 ? usable : [Math.Max(2048, ceiling)];
+    }
+
+    // Pre-GGUF-header behaviour, kept verbatim for models whose header can't be parsed.
+    private static BaselinePlan LegacyGpuBaseline(
+        LlamaSettings s,
+        (int ReserveMb, int CtxSize, bool FlashAttn, int Batch, int UBatch) preset,
+        long modelSizeMb, OptimizationProfile profile, HardwareInfo hw)
+    {
+        int estimatedLayers = modelSizeMb switch
+        {
+            < 2000  => 24, < 5000 => 32, < 10000 => 40, < 20000 => 60, _ => 80,
+        };
+        double mbPerLayer = (double)modelSizeMb / estimatedLayers;
+
         long vramForWeights = Math.Max(0, hw.FreeVramMb - preset.ReserveMb);
         int maxLayersInVram = mbPerLayer > 0 ? (int)(vramForWeights / mbPerLayer) : estimatedLayers;
+        int gpuLayers = maxLayersInVram >= estimatedLayers ? -1 : maxLayersInVram;
 
-        int gpuLayers = maxLayersInVram >= estimatedLayers
-            ? -1                  // entire model fits — offload all
-            : maxLayersInVram;
-
-        // Context: start from the tier default, respect profile cap.
-        // If the model barely squeezes into VRAM (< 2 GB headroom), start conservatively.
         int contextSize = Math.Min(preset.CtxSize, profile.TargetContextSize);
         if (gpuLayers != -1)
         {
-            long modelVramUsed = (long)(gpuLayers * mbPerLayer);
-            long headroom = hw.FreeVramMb - modelVramUsed;
+            long headroom = hw.FreeVramMb - (long)(gpuLayers * mbPerLayer);
             if      (headroom < 1536) contextSize = Math.Min(contextSize, 2048);
             else if (headroom < 3072) contextSize = Math.Min(contextSize, 4096);
             else if (headroom < 6144) contextSize = Math.Min(contextSize, 8192);
         }
 
-        return new LlamaSettings
-        {
-            GpuLayers      = gpuLayers,
-            ContextSize    = contextSize,
-            BatchSize      = preset.Batch,
-            UBatchSize     = preset.UBatch,
-            Threads        = threads,
-            ThreadsBatch   = threads,
-            FlashAttention = preset.FlashAttn,
-            Mmap           = true,
-            ThinkingEnabled = isThinking ? false : null,
-            RepeatPenalty  = DefaultRepeatPenalty,
-            RepeatLastN    = DefaultRepeatLastN,
-            DryMultiplier  = DefaultDryMultiplier,
-            Label          = "baseline",
-        };
+        s.GpuLayers      = gpuLayers;
+        s.ContextSize    = contextSize;
+        s.BatchSize      = preset.Batch;
+        s.UBatchSize     = preset.UBatch;
+        s.FlashAttention = preset.FlashAttn;
+        return new BaselinePlan(s,
+            $"GGUF header unreadable — using file-size tier estimate ({contextSize:N0} ctx, ngl={gpuLayers}).");
     }
+
+    // VRAM held back from the plan. GpuOverheadMb covers the driver/runtime context and compute
+    // buffers; the fraction absorbs allocator fragmentation and the fact that "free VRAM" drifts
+    // between the reading and the actual load.
+    private const long GpuOverheadMb = 900;
+    private const double VramSafetyFraction = 0.05;
+    // Below this expert share, per-layer offload isn't worth it and plain layer offload is used.
+    private const double MinExpertShareForOffload = 0.5;
+    // How much extra of the model must land in VRAM before quantized KV is preferred over f16.
+    private const double MinResidencyGainForKvQuant = 0.10;
+
+    // One evaluated (context, KV type) option. ResidentFraction is the share of the model's
+    // layers that would live in VRAM, which is the proxy the planner maximizes for speed.
+    private sealed record Candidate(
+        int Context, string? KvType, long KvMb, int GpuLayers, int? NCpuMoe,
+        double ResidentFraction, string How);
 
     // Conservative anti-repetition defaults applied to every baseline config. These guard
     // against degenerate decoding loops ("is is is is...") from the very first iteration

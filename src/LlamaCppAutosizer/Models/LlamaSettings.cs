@@ -28,6 +28,12 @@ public class LlamaSettings
     // Reduces active experts per token; null = use the model's built-in default
     public int? MoeExpertUsed { get; set; }
 
+    // Keeps the expert FFN weights of the first N layers on the CPU while attention and dense
+    // weights stay on the GPU. For an MoE model too large for VRAM this beats lowering GpuLayers,
+    // which evicts whole layers — attention included — and attention is exactly what you want on
+    // the GPU at long context. Costs no quality, unlike reducing MoeExpertUsed. null/0 = off.
+    public int? NCpuMoe { get; set; }
+
     // Thinking / chain-of-thought mode — only meaningful for thinking-capable models
     // (Qwen3, DeepSeek-R1, QwQ). null = model default (usually enabled).
     // false = disable thinking (shorter, faster responses); true = force enable.
@@ -82,13 +88,19 @@ public class LlamaSettings
         if (Mlock) args.Add("--mlock");
         if (CacheTypeK is not null) { args.Add("--cache-type-k"); args.Add(CacheTypeK); }
         if (CacheTypeV is not null) { args.Add("--cache-type-v"); args.Add(CacheTypeV); }
+        if (NCpuMoe is > 0) { args.Add("--n-cpu-moe"); args.Add(NCpuMoe.Value.ToString()); }
         if (MoeExpertUsed.HasValue)
         {
-            // The GGUF key is arch-prefixed (e.g. qwen3moe.expert_used_count) — an unprefixed
-            // or wrong key is silently ignored by llama-server, making the override a no-op.
-            string arch = Services.GgufMetadata.GetArchitecture(modelPath) ?? "llama";
-            args.Add("--override-kv");
-            args.Add($"{arch}.expert_used_count=int:{MoeExpertUsed.Value}");
+            // The expert-count key is architecture-scoped in GGUF ("gemma4.expert_used_count",
+            // "qwen3moe.expert_used_count", …) — there is no global alias. An --override-kv for a
+            // key the model doesn't have is silently ignored, so the prefix has to be read off the
+            // header. If the header is unreadable we emit nothing rather than a no-op override.
+            var arch = Services.GgufMetadataService.Read(modelPath)?.Architecture;
+            if (!string.IsNullOrEmpty(arch))
+            {
+                args.Add("--override-kv");
+                args.Add($"{arch}.expert_used_count=int:{MoeExpertUsed.Value}");
+            }
         }
         if (ThinkingEnabled.HasValue)
         {
@@ -133,6 +145,7 @@ public class LlamaSettings
         Threads, ThreadsBatch, FlashAttention, Mmap, Mlock,
         CacheTypeK ?? "f16", CacheTypeV ?? "f16",
         MoeExpertUsed?.ToString() ?? "default",
+        NCpuMoe?.ToString() ?? "0",
         ThinkingEnabled?.ToString() ?? "default",
         ParallelSlots, DefragThreshold,
         RopeScaling ?? "", RopeFreqBase?.ToString() ?? "", RopeFreqScale?.ToString() ?? "",
@@ -146,6 +159,7 @@ public class LlamaSettings
                 $"fa={FlashAttention} kv={CacheTypeK ?? "f16"}/{CacheTypeV ?? "f16"} " +
                 $"threads={Threads}/{ThreadsBatch}";
         if (MoeExpertUsed.HasValue) s += $" experts={MoeExpertUsed.Value}";
+        if (NCpuMoe is > 0) s += $" ncmoe={NCpuMoe.Value}";
         return s;
     }
 
@@ -163,10 +177,21 @@ public class LlamaSettings
         return false;
     }
 
-    /// <summary>Detects likely MoE architectures from the model filename.</summary>
+    /// <summary>
+    /// Detects MoE architectures. The GGUF header is authoritative when the file is readable —
+    /// plenty of MoE models (e.g. KAT-Coder, built on Qwen3.6-A3B) carry no MoE marker in their
+    /// filename at all. Filename heuristics are only a fallback for unreadable/missing files.
+    /// </summary>
     public static bool IsMoeModel(string? modelPath)
     {
         if (string.IsNullOrEmpty(modelPath)) return false;
+
+        // A header that parsed is conclusive in both directions: no expert_count key means the
+        // model really is dense. That also clears the filename heuristic's false positives —
+        // e.g. the DeepSeek-R1 *distills* are dense Qwen/Llama models despite the name.
+        var meta = Services.GgufMetadataService.Read(modelPath);
+        if (meta is not null) return meta.IsMoe;
+
         var name = Path.GetFileName(modelPath).ToLowerInvariant();
 
         // Explicit MoE names
